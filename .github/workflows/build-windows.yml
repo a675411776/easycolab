@@ -54,9 +54,19 @@ jobs:
       - name: Smoke-test packaged EasyColab.exe (CLI bridge & native main window)
         shell: pwsh
         run: |
-          $out = & .\dist\EasyColab\EasyColab.exe --bridge-cli auth_status
-          Write-Host "Bridge CLI smoke output: $out"
-          if (-not ($out -match '"ok"')) {
+          $psi = [System.Diagnostics.ProcessStartInfo]::new((Resolve-Path .\dist\EasyColab\EasyColab.exe).Path)
+          $psi.ArgumentList.Add("--bridge-cli")
+          $psi.ArgumentList.Add("auth_status")
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          $out = $proc.StandardOutput.ReadToEnd()
+          $err = $proc.StandardError.ReadToEnd()
+          $proc.WaitForExit()
+          Write-Host "Bridge CLI smoke output (exit $($proc.ExitCode)): $out"
+          if ($err) { Write-Host "Bridge CLI stderr: $err" }
+          if ($proc.ExitCode -ne 0 -or -not ($out -match '"ok"')) {
             throw "EasyColab.exe --bridge-cli smoke test failed!"
           }
           & .\windows_app\test_packaged_window.ps1 -ExePath .\dist\EasyColab\EasyColab.exe

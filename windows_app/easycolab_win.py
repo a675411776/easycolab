@@ -14,11 +14,29 @@ import sys
 from pathlib import Path
 
 
+def _is_valid_stdio_stream(stream: object) -> bool:
+    if stream is None:
+        return False
+    try:
+        fd = stream.fileno()  # type: ignore[attr-defined]
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle = msvcrt.get_osfhandle(fd)
+            if handle in (-1, -2, 0):
+                return False
+        os.fstat(fd)
+        stream.flush()  # type: ignore[attr-defined]
+        return True
+    except Exception:
+        return False
+
+
 def _ensure_gui_stdio() -> None:
-    """In Windows SUBSYSTEM:WINDOWS GUI mode, stdout/stderr are None unless piped."""
-    if sys.stdout is None:
+    """In Windows SUBSYSTEM:WINDOWS GUI mode, unpiped stdio handles are None or invalid (-2)."""
+    if not _is_valid_stdio_stream(sys.stdout):
         sys.stdout = open(os.devnull, "w", encoding="utf-8")
-    if sys.stderr is None:
+    if not _is_valid_stdio_stream(sys.stderr):
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
