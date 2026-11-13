@@ -376,6 +376,76 @@ extension StudioViewModel {
     }
 
     // MARK: - 本地历史媒体库（支持 MP4 视频与 PNG/JPG 图片，兼容旧目录）
+    private func extractEmbeddedPromptFromPNG(at url: URL) -> String? {
+        guard url.pathExtension.lowercased() == "png",
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let sig = try? handle.read(upToCount: 8),
+              sig == Data([137, 80, 78, 71, 13, 10, 26, 10]) else { return nil }
+
+        var rawTexts: [String: String] = [:]
+        while let hdr = try? handle.read(upToCount: 8), hdr.count == 8 {
+            let length = hdr.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            let typeStr = String(data: hdr.suffix(4), encoding: .isoLatin1) ?? ""
+            if typeStr == "IEND" { break }
+            if typeStr == "tEXt" && length > 0 && length < 512_000 {
+                if let body = try? handle.read(upToCount: Int(length)),
+                   let nulIdx = body.firstIndex(of: 0) {
+                    let key = String(data: body[..<nulIdx], encoding: .isoLatin1) ?? ""
+                    let valData = body[body.index(after: nulIdx)...]
+                    if let val = String(data: valData, encoding: .utf8) ?? String(data: valData, encoding: .isoLatin1) {
+                        rawTexts[key] = val
+                    }
+                }
+                _ = try? handle.read(upToCount: 4)
+            } else {
+                let skipBytes = UInt64(length) + 4
+                if let curOff = try? handle.offset() {
+                    try? handle.seek(toOffset: curOff + skipBytes)
+                } else {
+                    break
+                }
+            }
+        }
+
+        if let p = rawTexts["easycolab_prompt"]?.trimmingCharacters(in: .whitespacesAndNewlines), !p.isEmpty {
+            return p
+        }
+        if let comfyJSON = rawTexts["prompt"],
+           let jsonData = comfyJSON.data(using: .utf8),
+           let obj = (try? JSONSerialization.jsonObject(with: jsonData)) as? [String: Any] {
+            for (_, nodeAny) in obj {
+                guard let node = nodeAny as? [String: Any],
+                      let cls = node["class_type"] as? String,
+                      let inputs = node["inputs"] as? [String: Any] else { continue }
+                if cls == "TextGenerateV2", let pePrompt = inputs["prompt"] as? String {
+                    for marker in ["User editing instruction:", "User request:"] {
+                        if let rng = pePrompt.range(of: marker) {
+                            let clean = pePrompt[rng.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !clean.isEmpty { return clean }
+                        }
+                    }
+                    let clean = pePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !clean.isEmpty { return clean }
+                }
+            }
+            for (_, nodeAny) in obj {
+                guard let node = nodeAny as? [String: Any],
+                      let cls = node["class_type"] as? String,
+                      let inputs = node["inputs"] as? [String: Any] else { continue }
+                if (cls == "MiniMaxH3ImageConditioning" || cls == "CLIPTextEncode"),
+                   let directPrompt = inputs["prompt"] as? String ?? inputs["text"] as? String {
+                    let clean = directPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !clean.isEmpty { return clean }
+                }
+            }
+        }
+        if let params = rawTexts["parameters"]?.trimmingCharacters(in: .whitespacesAndNewlines), !params.isEmpty {
+            return params
+        }
+        return nil
+    }
+
     func refreshLocalMedia() {
         var allURLs: [URL] = []
         for dir in [localSaveDir] + legacySaveDirs {
@@ -394,24 +464,87 @@ extension StudioViewModel {
             guard validExts.contains(url.pathExtension.lowercased()) else { return false }
             return seenNames.insert(url.lastPathComponent).inserted
         }
+        var updatedPrompts = mediaPromptMap
+        var promptsChanged = false
         let items: [LocalMediaItem] = filtered.compactMap { url in
             let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
             let date = (attrs?[.creationDate] as? Date) ?? Date.distantPast
             let ext = url.pathExtension.lowercased()
             let fname = url.lastPathComponent
+            var pText = updatedPrompts[fname]
+            if (pText == nil || pText?.isEmpty == true), ext == "png" {
+                if let extracted = extractEmbeddedPromptFromPNG(at: url), !extracted.isEmpty {
+                    updatedPrompts[fname] = extracted
+                    pText = extracted
+                    promptsChanged = true
+                }
+            }
             return LocalMediaItem(
                 url: url,
                 filename: fname,
                 isImage: ext != "mp4",
                 createdAt: date,
-                elapsedSeconds: mediaElapsedMap[fname]
+                elapsedSeconds: mediaElapsedMap[fname],
+                promptText: pText,
+                negativePromptText: mediaNegativePromptMap[fname]
             )
         }.sorted(by: { $0.createdAt > $1.createdAt })
 
+        if promptsChanged {
+            mediaPromptMap = updatedPrompts
+        }
+
         self.localMediaItems = items
+        if let cur = currentMediaURL, !items.contains(where: { $0.url == cur }) {
+            player?.pause()
+            player = nil
+            currentPreviewImage = nil
+            currentMediaURL = nil
+        }
         if currentMediaURL == nil, let first = items.first {
             selectMedia(first.url)
         }
+    }
+
+    func deleteLocalMedia(at url: URL) {
+        if currentMediaURL == url {
+            player?.pause()
+            player = nil
+            currentPreviewImage = nil
+            currentMediaURL = nil
+        }
+        let fname = url.lastPathComponent
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+        }
+        mediaElapsedMap.removeValue(forKey: fname)
+        mediaPromptMap.removeValue(forKey: fname)
+        mediaNegativePromptMap.removeValue(forKey: fname)
+        refreshLocalMedia()
+        statusMessage = L("已将「\(fname)」移入废纸篓", "Moved \"\(fname)\" to Trash")
+    }
+
+    func clearAllLocalMedia() {
+        let count = localMediaItems.count
+        guard count > 0 else { return }
+        player?.pause()
+        player = nil
+        currentPreviewImage = nil
+        currentMediaURL = nil
+        for item in localMediaItems {
+            do {
+                try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
+            } catch {
+                try? FileManager.default.removeItem(at: item.url)
+            }
+            mediaElapsedMap.removeValue(forKey: item.filename)
+            mediaPromptMap.removeValue(forKey: item.filename)
+            mediaNegativePromptMap.removeValue(forKey: item.filename)
+        }
+        refreshLocalMedia()
+        statusMessage = L("已清空全部 \(count) 条本地生成记录（已移入废纸篓）", "Cleared all \(count) local history items (moved to Trash)")
     }
 
     func selectMedia(_ url: URL) {
@@ -468,7 +601,8 @@ extension StudioViewModel {
         } else if decoded.any_model_loaded == false {
             loadedModelsDetail = []
         }
-        modelLoaded = loadedModelIds.contains(selectedModelId) || (decoded.model_loaded ?? false)
+        let matchesSelectedModel = (decoded.selected_model_id == nil || decoded.selected_model_id?.isEmpty == true || decoded.selected_model_id == selectedModelId)
+        modelLoaded = loadedModelIds.contains(selectedModelId) || (matchesSelectedModel && (decoded.model_loaded ?? false))
         currentModelName = decoded.current_model ?? L(Self.defaultModelNameZh, Self.defaultModelNameEn)
         loadedContextLengthTokens = decoded.loaded_context_length ?? 0
 
@@ -479,15 +613,19 @@ extension StudioViewModel {
             }
         }
 
-        if let files = decoded.files, !files.isEmpty {
-            modelFiles = files
+        if let srvSelected = decoded.selected_model_id, !srvSelected.isEmpty, srvSelected != selectedModelId {
+            totalFileCount = max(activeModelSpec.defaultFiles.count, modelFiles.count)
+        } else {
+            if let files = decoded.files, !files.isEmpty {
+                modelFiles = files
+            }
+            downloadedCount = decoded.downloaded_count ?? downloadedCount
+            totalFileCount = decoded.total_count ?? activeModelSpec.defaultFiles.count
+            allDownloaded = decoded.all_downloaded ?? (downloadedCount == totalFileCount && totalFileCount > 0)
+            totalDiskSizeGB = decoded.total_size_gb ?? totalDiskSizeGB
+            bf16ShardsCount = decoded.bf16_shards_count ?? 0
         }
-        downloadedCount = decoded.downloaded_count ?? downloadedCount
-        totalFileCount = decoded.total_count ?? activeModelSpec.defaultFiles.count
-        allDownloaded = decoded.all_downloaded ?? (downloadedCount == totalFileCount && totalFileCount > 0)
-        totalDiskSizeGB = decoded.total_size_gb ?? totalDiskSizeGB
         drivePersisted = decoded.drive_persisted ?? false
-        bf16ShardsCount = decoded.bf16_shards_count ?? 0
         isDownloadingWeights = decoded.is_downloading ?? false
         isLoadingModel = decoded.is_loading_vram ?? false
         if let p = decoded.task_progress { modelTaskProgress = p }

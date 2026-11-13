@@ -687,15 +687,24 @@ extension MainStudioView {
         let openaiBase = "\(baseHost)/v1"
         let anthropicBase = baseHost
         let displayKey = vm.apiKeyEnabled ? vm.apiAccessKey : "sk-no-key-required"
-        let activeLLMRepo: String = {
-            if vm.selectedModelId == "qwen38_27b_gguf" { return "unsloth/Qwen3.8-27B-GGUF" }
-            if vm.selectedModelId == "qwen38_27b" { return "Qwen/Qwen3.8-27B" }
-            if vm.loadedModelIds.contains("qwen38_27b_gguf") && !vm.loadedModelIds.contains("qwen38_27b") {
-                return "unsloth/Qwen3.8-27B-GGUF"
-            }
-            return "Qwen/Qwen3.8-27B"
-        }()
-        let activeLLMDisplayName = activeLLMRepo.contains("GGUF") ? "Qwen3.8-27B-GGUF" : "Qwen3.8-27B"
+        let llmSpec = vm.activeGatewayLLMModelSpec
+        let activeLLMRepo = llmSpec.repoId
+        let activeLLMDisplayName = llmSpec.name
+
+        let localPort = vm.localProxyRunning ? vm.localProxyBoundPort : vm.localProxyPort
+        let localHostBase = "http://127.0.0.1:\(localPort)"
+        let localOpenAIBase = "\(localHostBase)/v1"
+        let localAnthropicBase = localHostBase
+        let localFixedKey = "sk-easycolab"
+        let autoModelAlias = LocalAPIGatewayServer.virtualModelID
+
+        let magpieSummary = """
+        # Magpie / 本地开发永久固定接入配置 (释放实例重连或切换模型均无需修改)
+        OpenAI Base URL:    \(localOpenAIBase)
+        Anthropic Base URL: \(localAnthropicBase)
+        API Key:            \(localFixedKey)
+        Model ID:           \(autoModelAlias)
+        """
 
         let samplePrompt1 = L("用三句话解释量子纠缠，并展示思考过程", "Explain quantum entanglement in 3 sentences with reasoning")
         let samplePrompt2 = L("帮我设计一个高并发网关架构", "Design a high-concurrency API gateway architecture")
@@ -756,6 +765,114 @@ extension MainStudioView {
         """
 
         return VStack(alignment: .leading, spacing: 16) {
+            WorkspaceCard(
+                title: L("本机固定反代网关（Magpie / 本地开发免改配置）", "Local Fixed Reverse Proxy (Zero-Reconfig for Magpie & Dev)"),
+                subtitle: L(
+                    "在 Mac 本机固定监听 127.0.0.1:\(localPort)，自动同步最新云端隧道与密钥；释放实例重开或切换破甲模型后 API 地址与配置永久不变",
+                    "Fixed localhost listener on 127.0.0.1:\(localPort) that auto-syncs tunnel URL & key — never reconfigure Magpie after instance restarts or model swaps"
+                ),
+                icon: "point.3.connected.trianglepath.dotted",
+                trailing: AnyView(
+                    HStack(spacing: 8) {
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(vm.localProxyRunning ? Color.green : (vm.localProxyEnabled ? Color.red : Color.secondary))
+                                .frame(width: 7, height: 7)
+                            Text(
+                                vm.localProxyRunning
+                                    ? L("运行中 · 127.0.0.1:\(vm.localProxyBoundPort)", "Active · 127.0.0.1:\(vm.localProxyBoundPort)")
+                                    : (vm.localProxyEnabled ? L("端口异常", "Port Error") : L("已关闭", "Disabled"))
+                            )
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(vm.localProxyRunning ? Color.green : (vm.localProxyEnabled ? Color.red : Color.secondary))
+                                .monospacedDigit()
+                        }
+                        Text("·")
+                            .foregroundStyle(.tertiary)
+                        Text(L("本地转发: \(vm.localProxyRequestCount) 次", "Forwarded: \(vm.localProxyRequestCount)"))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                )
+            ) {
+                HStack(spacing: 12) {
+                    Toggle(L("启用本机固定端口网关", "Enable Local Fixed-Port Gateway"), isOn: $vm.localProxyEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+
+                    Spacer()
+
+                    HStack(spacing: 6) {
+                        Text(L("本机端口", "Port"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("8787", text: $vm.localProxyPortDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12, design: .monospaced))
+                            .frame(width: 68)
+                            .onSubmit {
+                                vm.updateLocalProxyPortFromDraft()
+                            }
+                        Button(L("应用端口", "Apply")) {
+                            vm.updateLocalProxyPortFromDraft()
+                        }
+                        .controlSize(.small)
+
+                        Button(L("复制 Magpie 配置", "Copy Magpie Config")) {
+                            copyToPasteboard(
+                                magpieSummary,
+                                tip: L("已复制 Magpie 永久固定接入配置。", "Copied fixed Magpie gateway configuration.")
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+
+                if !vm.localProxyError.isEmpty {
+                    Text(vm.localProxyError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                Divider()
+
+                HStack(alignment: .top, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        endpointRow(
+                            label: "OpenAI URL",
+                            value: localOpenAIBase,
+                            tip: L("已复制本机 OpenAI Base URL", "Copied local OpenAI Base URL")
+                        )
+                        endpointRow(
+                            label: "Anthropic",
+                            value: localAnthropicBase,
+                            tip: L("已复制本机 Anthropic Base URL", "Copied local Anthropic Base URL")
+                        )
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        endpointRow(
+                            label: L("固定 API Key", "Local Key"),
+                            value: localFixedKey,
+                            tip: L("已复制本地固定密钥（转发时自动注入真实云端密钥）", "Copied local key (auto-injects cloud key)")
+                        )
+                        endpointRow(
+                            label: L("动态模型名", "Model ID"),
+                            value: autoModelAlias,
+                            tip: L("已复制动态路由模型 ID (easycolab-auto)", "Copied dynamic routing Model ID (easycolab-auto)")
+                        )
+                    }
+                }
+
+                Text(L(
+                    "当前 \(autoModelAlias) 自动指向：\(activeLLMDisplayName) (\(activeLLMRepo))。在 Magpie 中填入上方固定地址与 \(autoModelAlias) 后，平时只需在本客户端唤醒/加载模型或用完释放实例，Magpie 端永远无需改动；离线时自动返回标准 503 以配合 Magpie 故障转移。",
+                    "\(autoModelAlias) currently routes to: \(activeLLMDisplayName) (\(activeLLMRepo)). Configure Magpie once with the localhost URL & \(autoModelAlias) — wake/swap models or release instances anytime without touching Magpie (returns clean 503 when offline for Magpie failover)."
+                ))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             WorkspaceCard(
                 title: L("网关安全鉴权与运行状态", "Gateway Authentication & Status"),
                 subtitle: L(
@@ -1145,24 +1262,25 @@ extension MainStudioView {
                 )
             }
         case "i2i_edit":
+            let isMultiRefEdit = (vm.selectedModelId == "qwen_image_21" || vm.selectedModelId == "minimax_h3_image")
             WorkspaceCard(
-                title: vm.selectedModelId == "qwen_image_21"
+                title: isMultiRefEdit
                     ? L("指令修图参考原图", "Instruction Image-Editing References")
                     : L("图生图重绘参考底图", "Image-to-Image Reference"),
-                subtitle: vm.selectedModelId == "qwen_image_21"
-                    ? L("支持上传 1~2 张参考图进行局部编辑、换背景或多主体融合", "Upload 1–2 reference images for local edits, background swaps, or multi-subject fusion")
+                subtitle: isMultiRefEdit
+                    ? L("支持上传 1~2 张参考图进行多视角机位重构、局部编辑、换装或多主体融合（可直接输入中文指令）", "Upload 1–2 reference images for camera perspective shifts, local edits, or multi-subject fusion")
                     : L("上传参考原图并在左侧调节重绘幅度", "Upload a reference image and tune Denoising Strength in the left sidebar"),
                 icon: "wand.and.rays"
             ) {
                 HStack(spacing: 12) {
                     FrameDropWell(
-                        title: L("主参考图 1 (必选)", "Primary Reference 1 (Required)"),
+                        title: L("主参考图 1 (必选 · <Picture 1>)", "Primary Reference 1 (Required · <Picture 1>)"),
                         subtitle: L("拖入待编辑原图", "Drop source image to edit"),
                         image: $vm.firstFrameImage
                     )
-                    if vm.selectedModelId == "qwen_image_21" {
+                    if isMultiRefEdit {
                         FrameDropWell(
-                            title: L("融合参考图 2 (可选)", "Fusion Reference 2 (Optional)"),
+                            title: L("融合参考图 2 (可选 · <Picture 2>)", "Fusion Reference 2 (Optional · <Picture 2>)"),
                             subtitle: L("用于多图主体融合编辑", "For multi-image subject fusion"),
                             image: $vm.lastFrameImage
                         )
@@ -1270,6 +1388,25 @@ extension MainStudioView {
                 }
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
+            } else if vm.selectedModelId == "minimax_h3_image" {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                    Text(L(
+                        "MiniMax-H3-Image 采用 6 步无 CFG (cfg=1.0) 原生 4MP 架构：无需填写反向提示词，支持直接输入中文或英文生图/改机位修图指令（内置 Heretic 破甲扩写器自动对齐参考图细节）。",
+                        "MiniMax-H3-Image uses 6-step zero-CFG (cfg=1.0) native 4MP architecture: no Negative Prompt needed. Write Chinese or English prompts directly (built-in Heretic uncensored upsampler aligns reference details automatically)."
+                    ))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.accentColor.opacity(0.08))
+                )
             } else if mod == .image || mod == .video {
                 promptEditor(
                     title: L("反向提示词 Negative Prompt（可选，排除低质或多余元素）", "Negative Prompt (Optional — exclude low quality or unwanted elements)"),
@@ -1628,6 +1765,75 @@ extension MainStudioView {
                         NSWorkspace.shared.activateFileViewerSelecting([url])
                     }
                     .controlSize(.small)
+                    Button(role: .destructive) {
+                        vm.deleteLocalMedia(at: url)
+                    } label: {
+                        Label(L("删除", "Delete"), systemImage: "trash")
+                    }
+                    .controlSize(.small)
+                    .help(L("将当前文件移入废纸篓", "Move current file to Trash"))
+                }
+
+                let curFname = url.lastPathComponent
+                let curPrompt = (vm.mediaPromptMap[curFname] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let curNegPrompt = (vm.mediaNegativePromptMap[curFname] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !curPrompt.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "text.quote")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(Color.accentColor)
+                            Text(L("该图生成提示词", "Prompt Used"))
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            Button {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(curPrompt, forType: .string)
+                                vm.statusMessage = L("已复制该图提示词到剪贴板", "Copied prompt to clipboard")
+                            } label: {
+                                Label(L("复制", "Copy"), systemImage: "doc.on.doc")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                            .controlSize(.mini)
+
+                            Button {
+                                vm.visualPrompt = curPrompt
+                                if !curNegPrompt.isEmpty {
+                                    vm.negativePrompt = curNegPrompt
+                                }
+                                vm.statusMessage = L("已将该图提示词回填至上方编辑框", "Loaded prompt back into editor")
+                            } label: {
+                                Label(L("回填到输入框", "Reuse Prompt"), systemImage: "arrow.up.doc")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                            .controlSize(.mini)
+                        }
+
+                        Text(curPrompt)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.primary.opacity(0.9))
+                            .lineLimit(4)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        if !curNegPrompt.isEmpty {
+                            Text(L("反向提示词：\(curNegPrompt)", "Negative: \(curNegPrompt)"))
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(9)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.primary.opacity(0.045))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                    )
                 }
             }
         }
@@ -1640,13 +1846,38 @@ extension MainStudioView {
             subtitle: L("\(vm.localMediaItems.count) 个媒体文件", "\(vm.localMediaItems.count) media files"),
             icon: "clock.arrow.circlepath",
             trailing: AnyView(
-                Button {
-                    vm.refreshLocalMedia()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+                HStack(spacing: 6) {
+                    let isEmpty = vm.localMediaItems.isEmpty
+                    Button(role: .destructive) {
+                        vm.showClearHistoryConfirm = true
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 10.5, weight: .semibold))
+                            Text(L("清空", "Clear"))
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundStyle(isEmpty ? Color.secondary.opacity(0.55) : Color.red.opacity(0.9))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule().fill(isEmpty ? Color.primary.opacity(0.06) : Color.red.opacity(0.14))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isEmpty)
+                    .help(isEmpty
+                          ? L("当前暂无本地生成记录", "No local outputs to clear")
+                          : L("一键清空全部本地生成记录（移入废纸篓）", "Clear all local outputs (move to Trash)"))
+
+                    Button {
+                        vm.refreshLocalMedia()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(L("刷新本地列表", "Refresh local media list"))
                 }
-                .buttonStyle(.borderless)
-                .help(L("刷新本地列表", "Refresh local media list"))
             )
         ) {
             if vm.localMediaItems.isEmpty {
@@ -1659,46 +1890,86 @@ extension MainStudioView {
                     VStack(spacing: 3) {
                         ForEach(vm.localMediaItems) { item in
                             let selected = vm.currentMediaURL == item.url
-                            Button {
-                                vm.selectMedia(item.url)
-                            } label: {
-                                HStack(spacing: 7) {
-                                    Image(systemName: item.isImage ? "photo" : "film")
-                                        .font(.caption)
-                                        .foregroundStyle(selected ? Color.accentColor : Color.secondary)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.filename)
-                                            .font(.caption.weight(.medium))
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
-                                        Text(item.createdAt.formatted(
-                                            Date.FormatStyle(date: .abbreviated, time: .shortened, locale: displayLocale)
-                                        ))
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer(minLength: 4)
-                                    if let el = item.elapsedSeconds, el > 0 {
-                                        Text(formatDuration(el, compact: true))
-                                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            HStack(spacing: 5) {
+                                Button {
+                                    vm.selectMedia(item.url)
+                                } label: {
+                                    HStack(spacing: 7) {
+                                        Image(systemName: item.isImage ? "photo" : "film")
+                                            .font(.caption)
                                             .foregroundStyle(selected ? Color.accentColor : Color.secondary)
-                                            .padding(.horizontal, 5)
-                                            .padding(.vertical, 2)
-                                            .background(
-                                                Capsule()
-                                                    .fill(selected ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.06))
-                                            )
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(item.filename)
+                                                .font(.caption.weight(.medium))
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                            if let pTxt = item.promptText, !pTxt.isEmpty {
+                                                Text(pTxt)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.tail)
+                                            }
+                                            Text(item.createdAt.formatted(
+                                                Date.FormatStyle(date: .abbreviated, time: .shortened, locale: displayLocale)
+                                            ))
+                                                .font(.caption2)
+                                                .foregroundStyle(.tertiary)
+                                        }
+                                        Spacer(minLength: 2)
+                                        if let el = item.elapsedSeconds, el > 0 {
+                                            Text(formatDuration(el, compact: true))
+                                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                                .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 2)
+                                                .background(
+                                                    Capsule()
+                                                        .fill(selected ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.06))
+                                                )
+                                        }
                                     }
+                                    .contentShape(Rectangle())
                                 }
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 6)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .fill(selected ? Color.accentColor.opacity(0.15) : Color.clear)
-                                )
-                                .contentShape(Rectangle())
+                                .buttonStyle(.plain)
+                                .help((item.promptText?.isEmpty == false) ? item.promptText! : item.filename)
+
+                                Button {
+                                    vm.deleteLocalMedia(at: item.url)
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.system(size: 10.5))
+                                        .foregroundStyle(.secondary)
+                                        .padding(4)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help(L("移入废纸篓", "Move to Trash"))
                             }
-                            .buttonStyle(.plain)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(selected ? Color.accentColor.opacity(0.15) : Color.clear)
+                            )
+                            .contextMenu {
+                                Button {
+                                    NSWorkspace.shared.open(item.url)
+                                } label: {
+                                    Label(L("打开文件", "Open File"), systemImage: "arrow.up.forward.app")
+                                }
+                                Button {
+                                    NSWorkspace.shared.activateFileViewerSelecting([item.url])
+                                } label: {
+                                    Label(L("在 Finder 中显示", "Show in Finder"), systemImage: "folder")
+                                }
+                                Divider()
+                                Button(role: .destructive) {
+                                    vm.deleteLocalMedia(at: item.url)
+                                } label: {
+                                    Label(L("删除记录（移入废纸篓）", "Move to Trash"), systemImage: "trash")
+                                }
+                            }
                         }
                     }
                     .padding(.trailing, 2)
@@ -1707,6 +1978,20 @@ extension MainStudioView {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .frame(height: 330)
             }
+        }
+        .alert(
+            L("清空全部本地生成记录？", "Clear all local history?"),
+            isPresented: $vm.showClearHistoryConfirm
+        ) {
+            Button(L("取消", "Cancel"), role: .cancel) {}
+            Button(L("全部移入废纸篓", "Move All to Trash"), role: .destructive) {
+                vm.clearAllLocalMedia()
+            }
+        } message: {
+            Text(L(
+                "将把当前共 \(vm.localMediaItems.count) 个视频/图片文件移入 macOS 废纸篓（如误删可随时在废纸篓还原）。",
+                "This will move all \(vm.localMediaItems.count) local media files to macOS Trash."
+            ))
         }
     }
 

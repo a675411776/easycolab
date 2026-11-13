@@ -1089,25 +1089,35 @@ class ViewModelServicesMixin:
                     )
                     if r.status_code == 200:
                         data = r.json()
+                        if data.get("action_ok") is False:
+                            act_msg = str(data.get("action_message") or "")
+                            if "all_rfilenames" not in act_msg:
+                                self._dispatch_ui(
+                                    lambda d=data: self._apply_status_response(d, update_status_msg=True)
+                                )
+                                return
+                        else:
 
-                        def on_ok() -> None:
-                            self._apply_status_response(data, update_status_msg=True)
-                            reg = data.get("registered_model")
-                            if isinstance(reg, dict) and reg.get("id"):
-                                spec = OpenModelSpec.from_custom_dict(reg)
-                                MODEL_SPEC_MAP[spec.id] = spec
-                                idx = next((i for i, s in enumerate(self.custom_models) if s.id == spec.id), -1)
-                                if idx >= 0:
-                                    self.custom_models[idx] = spec
-                                else:
-                                    self.custom_models.append(spec)
-                                self._save_persisted_custom_models()
-                                self.select_model(spec.id)
-                                if auto_download:
-                                    self.download_model_weights()
+                            def on_ok() -> None:
+                                self._apply_status_response(data, update_status_msg=True)
+                                reg = data.get("registered_model")
+                                if isinstance(reg, dict) and reg.get("id"):
+                                    spec = OpenModelSpec.from_custom_dict(reg)
+                                    MODEL_SPEC_MAP[spec.id] = spec
+                                    idx = next((i for i, s in enumerate(self.custom_models) if s.id == spec.id), -1)
+                                    if idx >= 0:
+                                        self.custom_models[idx] = spec
+                                    else:
+                                        self.custom_models.append(spec)
+                                    self._synced_custom_model_ids_by_server.setdefault(base, set()).add(spec.id)
+                                    self._save_persisted_custom_models()
+                                    self.sync_local_gateway_snapshot()
+                                    self.select_model(spec.id)
+                                    if auto_download:
+                                        self.download_model_weights()
 
-                        self._dispatch_ui(on_ok)
-                        return
+                            self._dispatch_ui(on_ok)
+                            return
                 except Exception:
                     pass
                 self._dispatch_ui(
@@ -1162,6 +1172,7 @@ class ViewModelServicesMixin:
         else:
             self.custom_models.append(spec)
         self._save_persisted_custom_models()
+        self.sync_local_gateway_snapshot()
         self.select_model(spec.id)
         self.status_message = tr(
             f"已添加自定义模型「{final_name}」({clean_repo})，连接 Colab 后即可并发拉取至 Google Drive。",
@@ -1175,7 +1186,10 @@ class ViewModelServicesMixin:
             return
         self.custom_models = [s for s in self.custom_models if s.id != model_id]
         MODEL_SPEC_MAP.pop(model_id, None)
+        for synced_ids in self._synced_custom_model_ids_by_server.values():
+            synced_ids.discard(model_id)
         self._save_persisted_custom_models()
+        self.sync_local_gateway_snapshot()
         if self.selected_model_id == model_id:
             self.select_model(OPEN_MODEL_CATALOG[0].id)
         else:
@@ -1230,6 +1244,7 @@ class ViewModelServicesMixin:
     def regenerate_api_key(self) -> None:
         self.api_access_key = "sk-colab-" + secrets.token_hex(10)
         self._save_setting("apiAccessKey", self.api_access_key)
+        self.sync_local_gateway_snapshot()
         self.status_message = tr("已生成新的随机 API Key。", "Generated a new random API Key.")
         self.state_changed.emit()
         if self.is_connected:
@@ -1241,6 +1256,7 @@ class ViewModelServicesMixin:
                 return
             self.api_access_key = custom_key.strip()
             self._save_setting("apiAccessKey", self.api_access_key)
+            self.sync_local_gateway_snapshot()
         base = self.normalized_base_url
         if not self.is_connected or not base:
             return

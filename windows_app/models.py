@@ -43,6 +43,10 @@ _SHARD_DESC_EXACT: Dict[str, str] = {
     "Unsloth UD-Q4_K_M 主模型 (16.5 GB)": "Unsloth UD-Q4_K_M Main Weights (16.5 GB)",
     "多模态视觉投影器 (0.93 GB)": "Multimodal Vision Projector (0.93 GB)",
     "Unsloth MTP 多词元投机解码头 (1.31 GB)": "Unsloth MTP Speculative Head (1.31 GB)",
+    "33.1B DiT 图像主干 INT8-ConvRot (19.5 GB)": "33.1B DiT Backbone INT8-ConvRot (19.5 GB)",
+    "Qwen3-VL-32B 视觉编码器 INT8-ConvRot (25.3 GB)": "Qwen3-VL-32B Vision Encoder INT8-ConvRot (25.3 GB)",
+    "MiniMax 高保真图像 VAE FP16 (1.1 GB)": "MiniMax High-Fidelity Image VAE FP16 (1.1 GB)",
+    "Heretic 破甲提示词扩写器 W4A8 (7.5 GB)": "Heretic Uncensored Prompt Upsampler W4A8 (7.5 GB)",
     "图像 VAE": "Image VAE",
 }
 
@@ -619,6 +623,8 @@ class LocalMediaItem:
     is_image: bool
     created_ts: float
     elapsed_seconds: Optional[float] = None
+    prompt_text: Optional[str] = None
+    negative_prompt_text: Optional[str] = None
 
 
 @dataclass
@@ -834,14 +840,68 @@ OPEN_MODEL_CATALOG: List[OpenModelSpec] = [
         ],
     ),
     OpenModelSpec(
+        id="minimax_h3_image",
+        name_zh="MiniMax-H3-Image (65B)",
+        name_en="MiniMax-H3-Image (65B)",
+        repo_id="Comfy-Org/MiniMax-H3-Image",
+        badge_zh="65B 旗舰 6步超清 · 53.4 GB",
+        badge_en="65B Flagship 6-Step · 53.4 GB",
+        summary_zh="MiniMax 65B 级旗舰生图与空间修图模型（33.1B DiT + 32B 多模态编码器 + Heretic 破甲扩写），6 步无 CFG 直出 2K/4K 级摄影与多视角改机位修图",
+        summary_en="MiniMax 65B flagship T2I & spatial image-editing model (33.1B DiT + 32B VLM + Heretic uncensored prompt upsampler), 6-step zero-CFG native 2K–4K generation & camera-angle editing",
+        approx_size_gb=53.4,
+        icon="camera.aperture",
+        modality=ModelModality.IMAGE,
+        default_steps=6,
+        modes=[
+            TaskModeItem(
+                id="t2i",
+                title_zh="6 步超清文生图",
+                title_en="6-Step Ultra-HD Text-to-Image",
+                subtitle_zh="65B 旗舰空间构图、原生 4MP~16MP 超清直出与中英文直输自动扩写",
+                subtitle_en="65B spatial composition, native 4MP–16MP ultra-HD output & bilingual auto prompt expansion",
+                icon="photo.artframe",
+            ),
+            TaskModeItem(
+                id="i2i_edit",
+                title_zh="多图空间指令修图",
+                title_en="Multi-Image Spatial Edit",
+                subtitle_zh="上传 1~2 张参考图，用中文或英文指令精准改机位视角、换装或融合主体",
+                subtitle_en="Upload 1–2 reference images for 3D camera perspective shifts, outfit edits, or multi-subject fusion",
+                icon="wand.and.rays",
+            ),
+        ],
+        default_files=[
+            ModelFileItem(
+                name="diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors",
+                desc="33.1B DiT 图像主干 INT8-ConvRot (19.5 GB)",
+                desc_en="33.1B DiT Backbone INT8-ConvRot (19.5 GB)",
+            ),
+            ModelFileItem(
+                name="text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+                desc="Qwen3-VL-32B 视觉编码器 INT8-ConvRot (25.3 GB)",
+                desc_en="Qwen3-VL-32B Vision Encoder INT8-ConvRot (25.3 GB)",
+            ),
+            ModelFileItem(
+                name="vae/minimax_h3_image_vae_fp16.safetensors",
+                desc="MiniMax 高保真图像 VAE FP16 (1.1 GB)",
+                desc_en="MiniMax High-Fidelity Image VAE FP16 (1.1 GB)",
+            ),
+            ModelFileItem(
+                name="text_encoders/p-h3-image_prompt_upsampler_heretic_w4a8.safetensors",
+                desc="Heretic 破甲提示词扩写器 W4A8 (7.5 GB)",
+                desc_en="Heretic Uncensored Prompt Upsampler W4A8 (7.5 GB)",
+            ),
+        ],
+    ),
+    OpenModelSpec(
         id="qwen_image_21",
-        name_zh="Qwen-Image-2.1",
-        name_en="Qwen-Image-2.1",
+        name_zh="Qwen-Image-2.1 (破甲版)",
+        name_en="Qwen-Image-2.1 (Uncensored)",
         repo_id="Qwen/Qwen-Image-2.1",
-        badge_zh="文生图与修图 · 30.9 GB",
-        badge_en="T2I & Image Edit · 30.9 GB",
-        summary_zh="通义千问新一代旗舰图像生成与自然语言多图指令编辑模型",
-        summary_en="Flagship Qwen text-to-image generation and natural-language multi-image editing model",
+        badge_zh="破甲文生图与修图 · 30.9 GB",
+        badge_en="Uncensored T2I & Edit · 30.9 GB",
+        summary_zh="通义千问旗舰图像生成与多图指令修图模型（已换装 Step-90000 BF16 破甲满血主干）",
+        summary_en="Qwen flagship T2I & multi-image instruction editing model (Step-90000 BF16 Uncensored DiT)",
         approx_size_gb=30.9,
         icon="paintbrush.pointed",
         modality=ModelModality.IMAGE,
@@ -850,9 +910,9 @@ OPEN_MODEL_CATALOG: List[OpenModelSpec] = [
             TaskModeItem(
                 id="t2i",
                 title_zh="高清文生图",
-                title_en="HD Text to Image",
+                title_en="HD Text-to-Image",
                 subtitle_zh="复杂构图、精准中英文排版与高质感摄影/插画生成",
-                subtitle_en="Complex composition, accurate bilingual typography & studio-grade photography/illustration",
+                subtitle_en="Complex composition, accurate bilingual typography & high-fidelity photography/illustration",
                 icon="photo.artframe",
             ),
             TaskModeItem(
@@ -860,7 +920,7 @@ OPEN_MODEL_CATALOG: List[OpenModelSpec] = [
                 title_zh="多图指令修图",
                 title_en="Multi-Image Instruction Edit",
                 subtitle_zh="上传 1~2 张原图，用自然语言指令改局部、换背景或融合主体",
-                subtitle_en="Upload 1-2 reference images to edit regions, swap backgrounds, or fuse subjects via natural language",
+                subtitle_en="Upload 1–2 source images to edit regions, swap backgrounds, or fuse subjects via natural language",
                 icon="wand.and.rays",
             ),
         ],
@@ -985,6 +1045,51 @@ IMAGE_RESOLUTIONS: List[ResolutionOption] = [
         "1536 × 1024 (3:2 DSLR Photo)",
         1536,
         1024,
+    ),
+]
+
+MINIMAX_H3_IMAGE_RESOLUTIONS: List[ResolutionOption] = [
+    ResolutionOption(
+        "mh3_2048_2048",
+        "2048 × 2048 (1:1 原生 4MP 2K · 推荐)",
+        "2048 × 2048 (1:1 Native 4MP 2K · Recommended)",
+        2048,
+        2048,
+    ),
+    ResolutionOption(
+        "mh3_1792_2368",
+        "1792 × 2368 (3:4 竖构图写真 4MP)",
+        "1792 × 2368 (3:4 Portrait 4MP)",
+        1792,
+        2368,
+    ),
+    ResolutionOption(
+        "mh3_1504_2688",
+        "1504 × 2688 (9:16 竖版全身海报 4MP)",
+        "1504 × 2688 (9:16 Vertical Full-Body 4MP)",
+        1504,
+        2688,
+    ),
+    ResolutionOption(
+        "mh3_2688_1504",
+        "2688 × 1504 (16:9 电影宽画幅 4MP)",
+        "2688 × 1504 (16:9 Cinematic Widescreen 4MP)",
+        2688,
+        1504,
+    ),
+    ResolutionOption(
+        "mh3_2496_1664",
+        "2496 × 1664 (3:2 单反摄影横图 4MP)",
+        "2496 × 1664 (3:2 DSLR Landscape 4MP)",
+        2496,
+        1664,
+    ),
+    ResolutionOption(
+        "mh3_3104_3104",
+        "3104 × 3104 (1:1 极致 10MP 超清大图)",
+        "3104 × 3104 (1:1 Ultra-HD 10MP)",
+        3104,
+        3104,
     ),
 ]
 

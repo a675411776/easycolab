@@ -625,7 +625,7 @@ if os.path.exists(os.path.expanduser("~/.config/rclone/rclone.conf")):
 if not os.path.exists("/content/DiffSynth-Studio"):
     print("正在克隆 DiffSynth-Studio...", flush=True)
     subprocess.run(["git", "clone", "--depth", "1", "https://github.com/modelscope/DiffSynth-Studio.git", "/content/DiffSynth-Studio"], check=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "transformers", "accelerate", "bitsandbytes", "huggingface_hub", "hf_transfer", "qwen-vl-utils", "einops", "kernels>=0.17.2,<0.18.0", "av", "gradio", "modelscope", "imageio", "imageio-ffmpeg", "scipy", "soundfile", "librosa"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "transformers", "accelerate", "bitsandbytes", "huggingface_hub", "hf_transfer", "qwen-vl-utils", "einops", "kernels>=0.17.2,<0.18.0", "av", "gradio", "modelscope", "imageio", "imageio-ffmpeg", "scipy", "soundfile", "librosa", "sageattention"], check=True)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "fla-core", "flash-linear-attention"], check=False)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--only-binary=:all:", "causal-conv1d"], check=False)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", "/content/DiffSynth-Studio"], check=True)
@@ -636,6 +636,10 @@ else:
     except Exception:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "einops", "kernels>=0.17.2,<0.18.0"], check=False)
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--force-reinstall", "fla-core", "flash-linear-attention"], check=False)
+    try:
+        import sageattention  # noqa: F401
+    except Exception:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "sageattention"], check=False)
 
 # 2. 检查是否已有运行中的 app.py 或 llama-server，先清理旧进程释放 GPU 显存
 subprocess.run(["pkill", "-f", "python.*/content/app.py"], check=False)
@@ -648,7 +652,7 @@ if os.path.exists(log_path):
     os.remove(log_path)
 
 with open(log_path, "w") as out_f:
-    subprocess.Popen([sys.executable, "-u", "/content/app.py"], cwd="/content", env={**os.environ, "EASYCOLAB_ADMIN_PASSWORD": admin_password}, stdout=out_f, stderr=subprocess.STDOUT)
+    subprocess.Popen([sys.executable, "-u", "/content/app.py"], cwd="/content", env={**os.environ, "EASYCOLAB_ADMIN_PASSWORD": admin_password}, stdout=out_f, stderr=subprocess.STDOUT, start_new_session=True)
 
 url_re = re.compile(r"^EasyColab URL: (https://[a-zA-Z0-9-]+\.gradio\.live)$", re.MULTILINE)
 found_url = None

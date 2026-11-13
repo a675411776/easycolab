@@ -329,14 +329,52 @@ let OPEN_MODEL_CATALOG: [OpenModelSpec] = [
         ]
     ),
     OpenModelSpec(
+        id: "minimax_h3_image",
+        nameZh: "MiniMax-H3-Image (65B)",
+        nameEn: "MiniMax-H3-Image (65B)",
+        repoId: "Comfy-Org/MiniMax-H3-Image",
+        badgeZh: "65B 旗舰 6步超清 · 53.4 GB",
+        badgeEn: "65B Flagship 6-Step · 53.4 GB",
+        summaryZh: "MiniMax 65B 级旗舰生图与空间修图模型（33.1B DiT + 32B 多模态编码器 + Heretic 破甲扩写），6 步无 CFG 直出 2K/4K 级摄影与多视角改机位修图",
+        summaryEn: "MiniMax 65B flagship T2I & spatial image-editing model (33.1B DiT + 32B VLM + Heretic uncensored prompt upsampler), 6-step zero-CFG native 2K–4K generation & camera-angle editing",
+        approxSizeGB: 53.4,
+        icon: "camera.aperture",
+        modality: .image,
+        defaultSteps: 6,
+        modes: [
+            TaskModeItem(
+                id: "t2i",
+                titleZh: "6 步超清文生图",
+                titleEn: "6-Step Ultra-HD Text-to-Image",
+                subtitleZh: "65B 旗舰空间构图、原生 4MP~16MP 超清直出与中英文直输自动扩写",
+                subtitleEn: "65B spatial composition, native 4MP–16MP ultra-HD output & bilingual auto prompt expansion",
+                icon: "photo.artframe"
+            ),
+            TaskModeItem(
+                id: "i2i_edit",
+                titleZh: "多图空间指令修图",
+                titleEn: "Multi-Image Spatial Edit",
+                subtitleZh: "上传 1~2 张参考图，用中文或英文指令精准改机位视角、换装或融合主体",
+                subtitleEn: "Upload 1–2 reference images for 3D camera perspective shifts, outfit edits, or multi-subject fusion",
+                icon: "wand.and.rays"
+            )
+        ],
+        defaultFiles: [
+            ModelFileItem(name: "diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors", desc: "33.1B DiT 图像主干 INT8-ConvRot (19.5 GB)", exists: false, size_gb: 0),
+            ModelFileItem(name: "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors", desc: "Qwen3-VL-32B 视觉编码器 INT8-ConvRot (25.3 GB)", exists: false, size_gb: 0),
+            ModelFileItem(name: "vae/minimax_h3_image_vae_fp16.safetensors", desc: "MiniMax 高保真图像 VAE FP16 (1.1 GB)", exists: false, size_gb: 0),
+            ModelFileItem(name: "text_encoders/p-h3-image_prompt_upsampler_heretic_w4a8.safetensors", desc: "Heretic 破甲提示词扩写器 W4A8 (7.5 GB)", exists: false, size_gb: 0)
+        ]
+    ),
+    OpenModelSpec(
         id: "qwen_image_21",
-        nameZh: "Qwen-Image-2.1",
-        nameEn: "Qwen-Image-2.1",
+        nameZh: "Qwen-Image-2.1 (破甲版)",
+        nameEn: "Qwen-Image-2.1 (Uncensored)",
         repoId: "Qwen/Qwen-Image-2.1",
-        badgeZh: "文生图与修图 · 30.9 GB",
-        badgeEn: "Text-to-Image & Edit · 30.9 GB",
-        summaryZh: "通义千问新一代旗舰图像生成与自然语言多图指令编辑模型",
-        summaryEn: "Qwen flagship image generation & natural-language multi-image instruction editing model",
+        badgeZh: "破甲文生图与修图 · 30.9 GB",
+        badgeEn: "Uncensored T2I & Edit · 30.9 GB",
+        summaryZh: "通义千问旗舰图像生成与多图指令修图模型（已换装 Step-90000 BF16 破甲满血主干）",
+        summaryEn: "Qwen flagship T2I & multi-image instruction editing model (Step-90000 BF16 Uncensored DiT)",
         approxSizeGB: 30.9,
         icon: "paintbrush.pointed",
         modality: .image,
@@ -445,6 +483,15 @@ let IMAGE_RESOLUTIONS: [ResolutionOption] = [
     ResolutionOption(id: "i_1344_768", labelZh: "1344 × 768 (16:9 电影横幅)", labelEn: "1344 × 768 (16:9 Cinematic Widescreen)", width: 1344, height: 768),
     ResolutionOption(id: "i_768_1344", labelZh: "768 × 1344 (9:16 竖版海报)", labelEn: "768 × 1344 (9:16 Vertical Poster)", width: 768, height: 1344),
     ResolutionOption(id: "i_1536_1024", labelZh: "1536 × 1024 (3:2 单反摄影)", labelEn: "1536 × 1024 (3:2 DSLR Photo)", width: 1536, height: 1024)
+]
+
+let MINIMAX_H3_IMAGE_RESOLUTIONS: [ResolutionOption] = [
+    ResolutionOption(id: "mh3_2048_2048", labelZh: "2048 × 2048 (1:1 原生 4MP 2K · 推荐)", labelEn: "2048 × 2048 (1:1 Native 4MP 2K · Recommended)", width: 2048, height: 2048),
+    ResolutionOption(id: "mh3_1792_2368", labelZh: "1792 × 2368 (3:4 竖构图写真 4MP)", labelEn: "1792 × 2368 (3:4 Portrait 4MP)", width: 1792, height: 2368),
+    ResolutionOption(id: "mh3_1504_2688", labelZh: "1504 × 2688 (9:16 竖版全身海报 4MP)", labelEn: "1504 × 2688 (9:16 Vertical Full-Body 4MP)", width: 1504, height: 2688),
+    ResolutionOption(id: "mh3_2688_1504", labelZh: "2688 × 1504 (16:9 电影宽画幅 4MP)", labelEn: "2688 × 1504 (16:9 Cinematic Widescreen 4MP)", width: 2688, height: 1504),
+    ResolutionOption(id: "mh3_2496_1664", labelZh: "2496 × 1664 (3:2 单反摄影横图 4MP)", labelEn: "2496 × 1664 (3:2 DSLR Landscape 4MP)", width: 2496, height: 1664),
+    ResolutionOption(id: "mh3_3104_3104", labelZh: "3104 × 3104 (1:1 极致 10MP 超清大图)", labelEn: "3104 × 3104 (1:1 Ultra-HD 10MP)", width: 3104, height: 3104)
 ]
 
 struct PresetTemplate: Identifiable {
@@ -847,6 +894,8 @@ struct LocalMediaItem: Identifiable, Hashable {
     let isImage: Bool
     let createdAt: Date
     let elapsedSeconds: Double?
+    let promptText: String?
+    let negativePromptText: String?
 }
 
 func formatDuration(_ sec: Double, compact: Bool = false) -> String {

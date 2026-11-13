@@ -10,6 +10,7 @@ import json
 import os
 import secrets
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -21,10 +22,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 
+from windows_app.local_api_gateway import (
+    DEFAULT_PORT as LOCAL_GATEWAY_DEFAULT_PORT,
+    VIRTUAL_MODEL_ID as LOCAL_GATEWAY_VIRTUAL_MODEL_ID,
+    LocalAPIGatewayServer,
+    LocalGatewaySnapshot,
+)
 from windows_app.models import (
     IMAGE_RESOLUTIONS,
+    MINIMAX_H3_IMAGE_RESOLUTIONS,
     MODEL_SPEC_MAP,
     OPEN_MODEL_CATALOG,
     PRESET_TEMPLATES,
@@ -119,7 +127,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self.idle_timeout_minutes: int = int(self._settings.get("idleTimeoutMinutes", 30))
         if self.idle_timeout_minutes not in {0, 15, 30, 60}:
             self.idle_timeout_minutes = 30
-        self.context_length_k: int = max(4, min(256, int(self._settings.get("qwenContextLengthK", 32))))
+        self.context_length_k: int = max(4, min(256, int(self._settings.get("qwenContextLengthK", 256))))
         self.reasoning_effort: str = str(self._settings.get("reasoningEffort", "medium"))
         if self.reasoning_effort not in {"low", "medium", "high", "xhigh"}:
             self.reasoning_effort = "medium"
@@ -133,9 +141,44 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
             for k, v in (self._settings.get("mediaElapsedSecondsMap") or {}).items()
             if isinstance(v, (int, float))
         }
+        self.media_prompt_map: Dict[str, str] = {
+            str(k): str(v)
+            for k, v in (self._settings.get("mediaPromptTextMap") or {}).items()
+            if isinstance(v, str) and v.strip()
+        }
+        self.media_negative_prompt_map: Dict[str, str] = {
+            str(k): str(v)
+            for k, v in (self._settings.get("mediaNegativePromptTextMap") or {}).items()
+            if isinstance(v, str) and v.strip()
+        }
         self.has_seen_onboarding: bool = bool(self._settings.get("hasSeenOnboardingGuide_v1", False))
         self.combined_chart_mode: bool = bool(self._settings.get("combinedTelemetryChartMode", False))
         self.hf_token: str = str(self._settings.get("hfToken", ""))
+
+        # ── Local Fixed-Port Reverse Proxy Gateway (`127.0.0.1:8787`) ──
+        raw_gw_enabled = self._settings.get(
+            "localGatewayEnabled",
+            self._settings.get("localProxyEnabled", True),
+        )
+        self.local_gateway_enabled: bool = bool(raw_gw_enabled)
+        try:
+            raw_gw_port = int(
+                self._settings.get(
+                    "localGatewayPort",
+                    self._settings.get("localProxyPort", LOCAL_GATEWAY_DEFAULT_PORT),
+                )
+            )
+        except (TypeError, ValueError):
+            raw_gw_port = LOCAL_GATEWAY_DEFAULT_PORT
+        self.local_gateway_port: int = max(1024, min(65535, raw_gw_port))
+        self.local_gateway = LocalAPIGatewayServer(
+            on_request_forwarded=self._on_local_gateway_request_forwarded
+        )
+        self.local_gateway_running: bool = False
+        self.local_gateway_bound_port: int = 0
+        self.local_gateway_error: str = ""
+        self.local_gateway_request_count: int = 0
+        self._about_to_quit_connected: bool = False
 
         # ── Account & Headless Colab Bridge State ──
         self.cli_logged_in: bool = False
@@ -182,6 +225,9 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self._remote_context_synced: bool = False
         self._remote_idle_synced: bool = False
         self._remote_api_key_synced: bool = False
+        self._synced_custom_model_ids_by_server: Dict[str, set[str]] = {}
+        self._syncing_custom_models_inflight: set[str] = set()
+        self._poll_interval_sec: float = 1.2
 
         # ── Model Selection, Weights & VRAM State ──
         self.custom_models: List[OpenModelSpec] = []
@@ -198,11 +244,12 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self.total_size_gb: float = 0.0
         self.is_downloading_weights: bool = False
         self.is_loading_model: bool = False
+        self.is_auto_load_queued_after_download: bool = False
         self.model_task_progress: float = 0.0
 
         self.loaded_model_ids: List[str] = []
         self.loaded_models_detail: List[LoadedModelSummary] = []
-        self.loaded_context_length: int = 32768
+        self.loaded_context_length: int = 262144
         self.current_model_name: str = ""
 
         # ── Generation & Sampling State ──
@@ -278,9 +325,21 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self._elapsed_timer.setInterval(200)
         self._elapsed_timer.timeout.connect(self._on_elapsed_tick)
 
+        self.sync_local_gateway_snapshot()
+
     # ─── Initialization & Lifecycle ──────────────────────────────────────────
 
     def start(self) -> None:
+        app_inst = QCoreApplication.instance()
+        if app_inst is not None and not self._about_to_quit_connected:
+            try:
+                app_inst.aboutToQuit.connect(self.stop_local_gateway)
+                self._about_to_quit_connected = True
+            except Exception:
+                pass
+        self.sync_local_gateway_snapshot()
+        if self.local_gateway_enabled:
+            self.start_local_gateway()
         self.refresh_local_media_gallery(auto_select_first=True)
         self.refresh_official_colab_account_usage()
         if self.normalized_base_url:
@@ -296,13 +355,79 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
     # ─── Settings Helpers ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _portable_seed_candidates() -> List[Path]:
+        candidates: List[Path] = []
+        try:
+            exe_dir = Path(sys.executable).resolve().parent
+            candidates.append(exe_dir / "portable_seed.json")
+            candidates.append(exe_dir / "_internal" / "portable_seed.json")
+            # Support cross-compiled Windows layout where sys.executable is _internal/runtime/python.exe
+            if exe_dir.name.lower() == "runtime" and exe_dir.parent.name.lower() == "_internal":
+                candidates.append(exe_dir.parent.parent / "portable_seed.json")
+                candidates.append(exe_dir.parent / "portable_seed.json")
+        except Exception:
+            pass
+        return candidates
+
     def _load_settings_file(self) -> dict:
+        settings: Dict[str, Any] = {}
         if self._config_path.exists():
             try:
-                return json.loads(self._config_path.read_text(encoding="utf-8"))
+                loaded = json.loads(self._config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    settings = loaded
             except Exception:
-                return {}
-        return {}
+                settings = {}
+
+        # Optional portable bootstrap seed next to EasyColab.exe or inside _internal/
+        seed_data: Optional[Dict[str, Any]] = None
+        for seed_path in self._portable_seed_candidates():
+            try:
+                if seed_path.is_file():
+                    parsed_seed = json.loads(seed_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed_seed, dict):
+                        seed_data = parsed_seed
+                        break
+            except Exception:
+                continue
+
+        if seed_data:
+            changed = False
+            for key, val in seed_data.items():
+                if key == "customModels" and isinstance(val, list):
+                    cur_list = list(settings.get("customModels") or []) if isinstance(settings.get("customModels"), list) else []
+                    existing_ids = {
+                        str(item.get("id"))
+                        for item in cur_list
+                        if isinstance(item, dict) and item.get("id")
+                    }
+                    for seed_item in val:
+                        if isinstance(seed_item, dict) and seed_item.get("id"):
+                            sid = str(seed_item["id"])
+                            if sid not in existing_ids:
+                                cur_list.append(seed_item)
+                                existing_ids.add(sid)
+                                changed = True
+                    if changed or "customModels" not in settings:
+                        settings["customModels"] = cur_list
+                else:
+                    cur_val = settings.get(key)
+                    if key not in settings or cur_val in (None, "", [], {}):
+                        settings[key] = val
+                        changed = True
+
+            if changed or not self._config_path.exists():
+                try:
+                    self._config_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._config_path.write_text(
+                        json.dumps(settings, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+
+        return settings
 
     def _save_setting(self, key: str, value: Any) -> None:
         self._settings[key] = value
@@ -328,6 +453,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         set_lang(self.language)
         self._save_setting("language", self.language)
         self._translate_default_runtime_strings()
+        self.sync_local_gateway_snapshot()
         self.language_changed.emit()
 
     def toggle_language(self) -> None:
@@ -424,9 +550,17 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         cleaned = (url or "").strip()
         if cleaned != self.colab_server_url:
             self._remote_api_key_synced = False
+            self._synced_custom_model_ids_by_server.clear()
             self.colab_server_url = cleaned
             self._save_setting("colabServerURL", cleaned)
+            self.sync_local_gateway_snapshot()
             self.state_changed.emit()
+
+    def set_hf_token(self, token: str) -> None:
+        cleaned = (token or "").strip()
+        if cleaned != self.hf_token:
+            self.hf_token = cleaned
+            self._save_setting("hfToken", cleaned)
 
     def set_wake_gpu_choice(self, gpu: str) -> None:
         if gpu in {"G4", "H100", "A100", "L4", "T4"}:
@@ -466,9 +600,110 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         clamped = max(4, min(256, int(k_val)))
         self.context_length_k = clamped
         self._save_setting("qwenContextLengthK", clamped)
+        self.sync_local_gateway_snapshot()
         self.state_changed.emit()
         if sync_remote and self.is_connected:
             self.sync_context_length_to_colab()
+
+    # ─── Local Fixed-Port Reverse Proxy Gateway (`127.0.0.1:8787`) ───────────
+
+    @property
+    def active_gateway_llm_model_spec(self) -> OpenModelSpec:
+        spec = self.active_model_spec
+        if spec.modality == ModelModality.LLM_VLM:
+            return spec
+        for candidate in self.all_available_models:
+            if candidate.modality == ModelModality.LLM_VLM and candidate.id in self.loaded_model_ids:
+                return candidate
+        return MODEL_SPEC_MAP.get("qwen38_27b_gguf", OPEN_MODEL_CATALOG[0])
+
+    @property
+    def local_gateway_base_url(self) -> str:
+        port = self.local_gateway_bound_port or self.local_gateway_port or LOCAL_GATEWAY_DEFAULT_PORT
+        return f"http://127.0.0.1:{port}"
+
+    @property
+    def local_gateway_v1_url(self) -> str:
+        return f"{self.local_gateway_base_url}/v1"
+
+    def sync_local_gateway_snapshot(self) -> None:
+        llm_spec = self.active_gateway_llm_model_spec
+        eff_ctx = (
+            self.loaded_context_length
+            if (self.is_qwen_loaded_in_vram and self.loaded_context_length >= 4096)
+            else self.context_length_tokens
+        )
+        custom_repos = [s.repo_id for s in self.custom_models if s.repo_id]
+        self.local_gateway.update_snapshot(
+            LocalGatewaySnapshot(
+                upstream_base_url=self.normalized_base_url,
+                api_access_key=self.api_access_key,
+                is_connected=self.is_connected,
+                active_model_repo=llm_spec.repo_id,
+                active_model_name=llm_spec.name,
+                custom_repo_ids=custom_repos,
+                context_length_tokens=eff_ctx,
+            )
+        )
+
+    def start_local_gateway(self) -> bool:
+        self.sync_local_gateway_snapshot()
+        ok, err = self.local_gateway.start(self.local_gateway_port)
+        self.local_gateway_running = ok
+        self.local_gateway_bound_port = self.local_gateway.bound_port if ok else 0
+        self.local_gateway_error = "" if ok else err
+        self.state_changed.emit()
+        return ok
+
+    def stop_local_gateway(self) -> None:
+        self.local_gateway.stop()
+        self.local_gateway_running = False
+        self.local_gateway_bound_port = 0
+        self.local_gateway_error = ""
+        self.state_changed.emit()
+
+    def set_local_gateway_enabled(self, enabled: bool) -> None:
+        flag = bool(enabled)
+        self.local_gateway_enabled = flag
+        self._save_setting("localGatewayEnabled", flag)
+        if flag:
+            self.start_local_gateway()
+        else:
+            self.stop_local_gateway()
+
+    def apply_local_gateway_port(self, port_val: Any) -> None:
+        try:
+            parsed = int(str(port_val).strip())
+        except (TypeError, ValueError):
+            self.status_message = tr(
+                "请输入合法的本地端口号（1024 ~ 65535）。",
+                "Please enter a valid local port number (1024 – 65535).",
+            )
+            self.state_changed.emit()
+            return
+        clamped = max(1024, min(65535, parsed))
+        self.local_gateway_port = clamped
+        self._save_setting("localGatewayPort", clamped)
+        if self.local_gateway_enabled:
+            ok = self.start_local_gateway()
+            if ok:
+                self.status_message = tr(
+                    f"本地固定反向代理已绑定至 127.0.0.1:{self.local_gateway_bound_port}。",
+                    f"Local fixed reverse proxy bound to 127.0.0.1:{self.local_gateway_bound_port}.",
+                )
+            else:
+                self.status_message = self.local_gateway_error
+            self.state_changed.emit()
+        else:
+            self.state_changed.emit()
+
+    def _on_local_gateway_request_forwarded(self) -> None:
+        def inc() -> None:
+            self.local_gateway_request_count += 1
+            self.api_request_count += 1
+            self.state_changed.emit()
+
+        self._dispatch_ui(inc)
 
     # ─── Computed Properties ─────────────────────────────────────────────────
 
@@ -520,7 +755,13 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
     @property
     def is_qwen_loaded_in_vram(self) -> bool:
-        return ("qwen38_27b_gguf" in self.loaded_model_ids) or ("qwen38_27b" in self.loaded_model_ids)
+        if ("qwen38_27b_gguf" in self.loaded_model_ids) or ("qwen38_27b" in self.loaded_model_ids):
+            return True
+        for mid in self.loaded_model_ids:
+            spec = MODEL_SPEC_MAP.get(mid)
+            if spec is not None and spec.modality == ModelModality.LLM_VLM:
+                return True
+        return False
 
     @property
     def display_account_label(self) -> str:
@@ -562,10 +803,84 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
     # ─── Local Media Gallery Management ──────────────────────────────────────
 
+    @staticmethod
+    def _extract_embedded_prompt_from_png(path: Path) -> Optional[str]:
+        if path.suffix.lower() != ".png":
+            return None
+        try:
+            with path.open("rb") as fp:
+                header = fp.read(8)
+                if header != b"\x89PNG\r\n\x1a\n":
+                    return None
+                text_map: Dict[str, str] = {}
+                while True:
+                    chunk_hdr = fp.read(8)
+                    if len(chunk_hdr) < 8:
+                        break
+                    length, chunk_type = struct.unpack(">I4s", chunk_hdr)
+                    if chunk_type == b"IEND":
+                        break
+                    if chunk_type == b"tEXt" and 0 < length <= 262144:
+                        chunk_data = fp.read(length)
+                        fp.seek(4, os.SEEK_CUR)  # CRC
+                        sep = chunk_data.find(b"\x00")
+                        if sep > 0:
+                            key = chunk_data[:sep].decode("latin-1", errors="ignore").strip()
+                            val = chunk_data[sep + 1 :].decode("utf-8", errors="ignore").strip()
+                            if key and val:
+                                text_map[key] = val
+                        continue
+                    fp.seek(length + 4, os.SEEK_CUR)
+
+            if text_map.get("easycolab_prompt"):
+                return text_map["easycolab_prompt"]
+            if text_map.get("prompt"):
+                try:
+                    graph = json.loads(text_map["prompt"])
+                    if isinstance(graph, dict):
+                        candidates: List[str] = []
+                        for node in graph.values():
+                            if not isinstance(node, dict):
+                                continue
+                            ctype = str(node.get("class_type") or "")
+                            inputs = node.get("inputs")
+                            if not isinstance(inputs, dict):
+                                continue
+                            if ctype in ("TextGenerateV2", "MiniMaxH3ImageConditioning"):
+                                p = inputs.get("prompt")
+                                if isinstance(p, str) and p.strip():
+                                    return p.strip()
+                            elif ctype == "CLIPTextEncode":
+                                p = inputs.get("text")
+                                if isinstance(p, str) and p.strip():
+                                    candidates.append(p.strip())
+                        if candidates:
+                            return max(candidates, key=len)
+                except Exception:
+                    pass
+            if text_map.get("parameters"):
+                first_block = text_map["parameters"].split("\nNegative prompt:")[0].strip()
+                if first_block:
+                    return first_block
+        except Exception:
+            pass
+        return None
+
+    @property
+    def current_selected_media_item(self) -> Optional[LocalMediaItem]:
+        cur = self.current_media_path
+        if cur is None:
+            return None
+        for item in self.local_media_items:
+            if item.path == cur:
+                return item
+        return None
+
     def refresh_local_media_gallery(self, auto_select_first: bool = False) -> None:
         exts = {".mp4", ".png", ".jpg", ".jpeg", ".webp"}
         seen_names = set()
         found: List[LocalMediaItem] = []
+        prompt_cache_updated = False
 
         for folder in get_legacy_media_dirs():
             if not folder.exists():
@@ -582,6 +897,14 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                         ctime = stat.st_mtime
                     except Exception:
                         ctime = 0.0
+                    prompt_txt = self.media_prompt_map.get(entry.name)
+                    if not prompt_txt and entry.suffix.lower() == ".png":
+                        embedded = self._extract_embedded_prompt_from_png(entry)
+                        if embedded:
+                            prompt_txt = embedded
+                            self.media_prompt_map[entry.name] = embedded
+                            prompt_cache_updated = True
+                    neg_txt = self.media_negative_prompt_map.get(entry.name)
                     found.append(
                         LocalMediaItem(
                             path=entry,
@@ -589,13 +912,23 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                             is_image=(entry.suffix.lower() != ".mp4"),
                             created_ts=ctime,
                             elapsed_seconds=self.media_elapsed_map.get(entry.name),
+                            prompt_text=prompt_txt,
+                            negative_prompt_text=neg_txt,
                         )
                     )
             except Exception:
                 pass
 
+        if prompt_cache_updated:
+            self._save_setting("mediaPromptTextMap", self.media_prompt_map)
+
         found.sort(key=lambda x: x.created_ts, reverse=True)
         self.local_media_items = found
+
+        if self.current_media_path is not None and not self.current_media_path.exists():
+            self.current_media_path = None
+            self.media_selected.emit(None, None, False)
+
         self.media_list_changed.emit()
 
         if auto_select_first and self.current_media_path is None and found:
@@ -605,6 +938,70 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self.current_media_path = path
         elapsed = self.media_elapsed_map.get(path.name) if path else None
         self.media_selected.emit(path, elapsed, auto_play)
+
+    def delete_local_media(self, path: Path) -> None:
+        target = Path(path)
+        fname = target.name
+        if self.current_media_path == target:
+            self.current_media_path = None
+            self.media_selected.emit(None, None, False)
+
+        try:
+            if target.exists():
+                target.unlink()
+        except Exception as exc:
+            self.status_message = tr(
+                f"删除本地文件失败：{exc}",
+                f"Failed to delete local media file: {exc}",
+            )
+            self.state_changed.emit()
+            return
+
+        if fname in self.media_elapsed_map:
+            self.media_elapsed_map.pop(fname, None)
+            self._save_setting("mediaElapsedSecondsMap", self.media_elapsed_map)
+        if fname in self.media_prompt_map:
+            self.media_prompt_map.pop(fname, None)
+            self._save_setting("mediaPromptTextMap", self.media_prompt_map)
+        if fname in self.media_negative_prompt_map:
+            self.media_negative_prompt_map.pop(fname, None)
+            self._save_setting("mediaNegativePromptTextMap", self.media_negative_prompt_map)
+
+        self.refresh_local_media_gallery(auto_select_first=True)
+        self.status_message = tr(
+            f"已删除本地记录：{fname}",
+            f"Deleted local media item: {fname}",
+        )
+        self.state_changed.emit()
+
+    def clear_all_local_media(self) -> None:
+        items = list(self.local_media_items)
+        if not items:
+            return
+        self.current_media_path = None
+        self.media_selected.emit(None, None, False)
+
+        removed = 0
+        for item in items:
+            try:
+                if item.path.exists():
+                    item.path.unlink()
+                removed += 1
+                self.media_elapsed_map.pop(item.filename, None)
+                self.media_prompt_map.pop(item.filename, None)
+                self.media_negative_prompt_map.pop(item.filename, None)
+            except Exception:
+                pass
+
+        self._save_setting("mediaElapsedSecondsMap", self.media_elapsed_map)
+        self._save_setting("mediaPromptTextMap", self.media_prompt_map)
+        self._save_setting("mediaNegativePromptTextMap", self.media_negative_prompt_map)
+        self.refresh_local_media_gallery(auto_select_first=False)
+        self.status_message = tr(
+            f"已清空本地生成记录（共移除 {removed} 项）。",
+            f"Cleared local media library ({removed} items removed).",
+        )
+        self.state_changed.emit()
 
     def export_or_reveal_notebook(self) -> None:
         nb_src = resolve_resource_path("EasyColab_Server.ipynb")
@@ -659,6 +1056,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                 self.is_generating
                 or self.is_downloading_weights
                 or self.is_loading_model
+                or self.is_auto_load_queued_after_download
                 or self.comfy_starting
                 or self.comfy_downloading_weight
                 or self.comfy_queue_running > 0
@@ -698,6 +1096,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self.loaded_models_detail.clear()
         self.is_downloading_weights = False
         self.is_loading_model = False
+        self.is_auto_load_queued_after_download = False
         self.is_generating = False
         self.comfy_running = False
         self.comfy_starting = False
@@ -706,6 +1105,8 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self._remote_context_synced = False
         self._remote_idle_synced = False
         self._remote_api_key_synced = False
+        self._synced_custom_model_ids_by_server.clear()
+        self.sync_local_gateway_snapshot()
         if message:
             self.status_message = strip_emoji(self.masked_url(message))
         self.state_changed.emit()
@@ -781,7 +1182,6 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
             "drive_free_gb",
             "cu_burn_rate_per_hour",
             "session_cu_used",
-            "total_size_gb",
             "task_progress",
         ):
             if d.get(attr) is not None:
@@ -805,12 +1205,18 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         if isinstance(d.get("custom_models"), list):
             self._merge_remote_custom_models(d["custom_models"])
 
+        remote_sel = str(d.get("selected_model_id") or "").strip()
+        matches_selected = (not remote_sel) or (remote_sel == self.selected_model_id)
+
         if isinstance(d.get("loaded_model_ids"), list):
             self.loaded_model_ids = [str(x) for x in d["loaded_model_ids"]]
         elif d.get("loaded_model_id"):
             self.loaded_model_ids = [str(d["loaded_model_id"])]
         elif d.get("any_model_loaded") is False:
             self.loaded_model_ids = []
+        elif matches_selected and d.get("model_loaded") is True:
+            if self.selected_model_id not in self.loaded_model_ids:
+                self.loaded_model_ids.append(self.selected_model_id)
 
         if isinstance(d.get("loaded_models_detail"), list):
             self.loaded_models_detail = [LoadedModelSummary.from_dict(x) for x in d["loaded_models_detail"]]
@@ -818,13 +1224,20 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         if d.get("current_model"):
             self.current_model_name = strip_emoji(str(d["current_model"]))
 
-        # Update files list only if response matches currently selected model
-        resp_model = d.get("selected_model_id")
-        if (not resp_model or resp_model == self.selected_model_id) and isinstance(d.get("files"), list):
-            self.model_files = [ModelFileItem.from_dict(x) for x in d["files"]]
-            self.downloaded_count = int(d.get("downloaded_count", sum(1 for f in self.model_files if f.exists)))
-            self.total_count = int(d.get("total_count", len(self.model_files)))
-            self.all_downloaded = bool(d.get("all_downloaded", self.total_count > 0 and self.downloaded_count >= self.total_count))
+        # Cross-model guard: NEVER overwrite local files / 0/29 counts / total_size_gb when
+        # server response belongs to a different model (e.g. fresh VM defaulting to minimax_h3).
+        if matches_selected:
+            if isinstance(d.get("files"), list):
+                self.model_files = [ModelFileItem.from_dict(x) for x in d["files"]]
+                self.downloaded_count = int(d.get("downloaded_count", sum(1 for f in self.model_files if f.exists)))
+                self.total_count = int(d.get("total_count", len(self.model_files)))
+                self.all_downloaded = bool(
+                    d.get("all_downloaded", self.total_count > 0 and self.downloaded_count >= self.total_count)
+                )
+            if d.get("total_size_gb") is not None:
+                self.total_size_gb = float(d["total_size_gb"])
+        else:
+            self.total_count = max(len(self.active_model_spec.default_files), len(self.model_files))
 
         if d.get("is_downloading") is not None:
             self.is_downloading_weights = bool(d["is_downloading"])
@@ -893,9 +1306,119 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
             self._remote_api_key_synced = True
             self.sync_api_key_to_colab(initialize_only=True)
 
+        self.sync_local_gateway_snapshot()
         self._record_telemetry_sample(force=not was_connected)
         self.state_changed.emit()
         self.telemetry_changed.emit()
+
+    @staticmethod
+    def _server_modality_str(modality: ModelModality) -> str:
+        if modality == ModelModality.VIDEO_AUDIO:
+            return "video_audio"
+        if modality == ModelModality.IMAGE:
+            return "image"
+        return "llm_vlm"
+
+    def _build_custom_spec_fields(self, spec: OpenModelSpec) -> Dict[str, Any]:
+        if not spec.is_custom:
+            return {}
+        return {
+            "repo_id": spec.repo_id,
+            "include_pattern": spec.include_pattern,
+            "custom_name": spec.name_zh,
+            "modality": self._server_modality_str(spec.modality),
+            "hf_token": self.hf_token.strip(),
+        }
+
+    def _sync_custom_models_on_status_if_needed(self, base: str, d: dict) -> None:
+        if not base or not self.is_connected:
+            return
+        remote_custom_raw = d.get("custom_models")
+        remote_custom_ids = {
+            str(item.get("id"))
+            for item in (remote_custom_raw if isinstance(remote_custom_raw, list) else [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        remote_sel = str(d.get("selected_model_id") or "").strip()
+        synced_set = self._synced_custom_model_ids_by_server.setdefault(base, set())
+        synced_set.update(remote_custom_ids)
+
+        active_spec = self.active_model_spec
+        if active_spec.modality != ModelModality.COMFY_UI:
+            active_custom_missing = active_spec.is_custom and active_spec.id not in remote_custom_ids
+            sel_token = f"__sel__:{self.selected_model_id}"
+            sel_mismatch = bool(remote_sel and remote_sel != self.selected_model_id and sel_token not in synced_set)
+            if (active_custom_missing and active_spec.id not in synced_set) or sel_mismatch:
+                synced_set.add(sel_token)
+                if active_spec.is_custom:
+                    synced_set.add(active_spec.id)
+                self.notify_remote_select_model(self.selected_model_id, update_status_msg=False)
+
+        unsynced_specs = [
+            s
+            for s in self.custom_models
+            if s.id not in remote_custom_ids
+            and s.id not in synced_set
+            and s.id != self.selected_model_id
+        ]
+        if unsynced_specs and base not in self._syncing_custom_models_inflight:
+            for s in unsynced_specs:
+                synced_set.add(s.id)
+            self._syncing_custom_models_inflight.add(base)
+            intended_sel = self.selected_model_id
+            intended_spec = self.active_model_spec
+            hf_tok = self.hf_token.strip()
+
+            def bg_sync_worker(specs_to_sync: List[OpenModelSpec] = unsynced_specs) -> None:
+                need_restore = False
+                try:
+                    for s in specs_to_sync:
+                        mod_val = self._server_modality_str(s.modality)
+                        try:
+                            rr = self._admin_request(
+                                "POST",
+                                f"{base}/minimax_api/custom_model/register",
+                                json={
+                                    "repo_id": s.repo_id,
+                                    "include_pattern": s.include_pattern,
+                                    "custom_name": s.name_zh,
+                                    "display_name": s.name_zh,
+                                    "modality": mod_val,
+                                    "modality_hint": mod_val,
+                                    "hf_token": hf_tok,
+                                    "auto_download": False,
+                                    "preserve_selection": True,
+                                },
+                                timeout=30,
+                            )
+                            if rr.status_code == 200:
+                                rdata = rr.json()
+                                if rdata.get("selected_model_id") and rdata.get("selected_model_id") != intended_sel:
+                                    need_restore = True
+                        except Exception:
+                            pass
+
+                    if need_restore and intended_spec.modality != ModelModality.COMFY_UI:
+                        restore_payload: Dict[str, Any] = {
+                            "model_id": intended_sel,
+                            **self._build_custom_spec_fields(intended_spec),
+                        }
+                        try:
+                            sr = self._admin_request(
+                                "POST",
+                                f"{base}/minimax_api/select_model",
+                                json=restore_payload,
+                                timeout=25,
+                            )
+                            if sr.status_code == 200:
+                                sdata = sr.json()
+                                self._dispatch_ui(lambda sd=sdata: self._apply_status_response(sd, update_status_msg=False))
+                        except Exception:
+                            pass
+                finally:
+                    self._syncing_custom_models_inflight.discard(base)
+
+            threading.Thread(target=bg_sync_worker, daemon=True).start()
 
     def check_colab_status(self, silent: bool = False) -> None:
         base = self.normalized_base_url
@@ -923,7 +1446,12 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                 )
                 if r.status_code == 200:
                     payload = r.json()
-                    self._dispatch_ui(lambda: self._apply_status_response(payload, update_status_msg=not silent))
+
+                    def on_status_ok(pl: dict = payload) -> None:
+                        self._apply_status_response(pl, update_status_msg=not silent)
+                        self._sync_custom_models_on_status_if_needed(base, pl)
+
+                    self._dispatch_ui(on_status_ok)
                 elif r.status_code == 404:
 
                     def on_404() -> None:
@@ -969,6 +1497,35 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
     # ─── Model Selection, Weight Download, Load & Unload ─────────────────────
 
+    def notify_remote_select_model(self, model_id: Optional[str] = None, update_status_msg: bool = True) -> None:
+        target_id = model_id or self.selected_model_id
+        spec = MODEL_SPEC_MAP.get(target_id, self.active_model_spec)
+        base = self.normalized_base_url
+        if not self.is_connected or not base or spec.modality == ModelModality.COMFY_UI:
+            return
+        req_json: Dict[str, Any] = {
+            "model_id": target_id,
+            **self._build_custom_spec_fields(spec),
+        }
+
+        def worker() -> None:
+            try:
+                r = self._admin_request(
+                    "POST",
+                    f"{base}/minimax_api/select_model",
+                    json=req_json,
+                    timeout=30,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    self._dispatch_ui(
+                        lambda d=data: self._apply_status_response(d, update_status_msg=update_status_msg)
+                    )
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def select_model(self, model_id: str) -> None:
         if model_id not in MODEL_SPEC_MAP:
             return
@@ -977,35 +1534,91 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         if spec.modes:
             self.task_mode_id = spec.modes[0].id
         self.inference_steps = spec.default_steps
+        if spec.id == "minimax_h3_image":
+            if self.selected_image_res not in MINIMAX_H3_IMAGE_RESOLUTIONS:
+                self.selected_image_res = MINIMAX_H3_IMAGE_RESOLUTIONS[0]
+        elif spec.modality == ModelModality.IMAGE:
+            if self.selected_image_res not in IMAGE_RESOLUTIONS:
+                self.selected_image_res = IMAGE_RESOLUTIONS[0]
+
         self.model_files = [f.clone() for f in spec.default_files]
         self.downloaded_count = sum(1 for f in self.model_files if f.exists)
         self.total_count = len(self.model_files)
         self.all_downloaded = False
+        self.total_size_gb = 0.0
+        self.sync_local_gateway_snapshot()
         self.state_changed.emit()
 
         base = self.normalized_base_url
         if self.is_connected and base and spec.modality != ModelModality.COMFY_UI:
-
-            def worker() -> None:
-                try:
-                    r = self._admin_request("POST",
-                        f"{base}/minimax_api/select_model",
-                        json={"model_id": model_id},
-                        timeout=30,
-                    )
-                    if r.status_code == 200:
-                        data = r.json()
-                        self._dispatch_ui(lambda: self._apply_status_response(data, update_status_msg=True))
-                except Exception:
-                    pass
-
-            threading.Thread(target=worker, daemon=True).start()
+            self.notify_remote_select_model(model_id, update_status_msg=True)
         elif self.is_connected and base:
             self.check_colab_status(silent=True)
 
     def set_task_mode(self, mode_id: str) -> None:
         self.task_mode_id = mode_id
         self.state_changed.emit()
+
+    def _run_download_weights_worker(
+        self,
+        base: str,
+        spec: OpenModelSpec,
+        silent_completion_status: bool = False,
+    ) -> bool:
+        target_model = spec.id
+        req_json: Dict[str, Any] = {
+            "model_id": target_model,
+            "hf_token": self.hf_token.strip(),
+            **self._build_custom_spec_fields(spec),
+        }
+        r = self._admin_request(
+            "POST",
+            f"{base}/minimax_api/download_model",
+            json=req_json,
+            timeout=60,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.json()
+        self._dispatch_ui(
+            lambda d=data: self._apply_status_response(
+                d,
+                update_status_msg=not silent_completion_status or bool(d.get("action_ok") is False),
+            )
+        )
+        if data.get("action_ok") is False:
+            return False
+
+        last_status: Dict[str, Any] = data
+        while True:
+            time.sleep(self._poll_interval_sec)
+            sr = self._admin_request(
+                "GET",
+                f"{base}/minimax_api/status",
+                params={"model_id": target_model},
+                timeout=25,
+            )
+            if sr.status_code != 200:
+                break
+            sdata = sr.json()
+            last_status = sdata
+            still_dl = bool(sdata.get("is_downloading", False))
+            self._dispatch_ui(
+                lambda sd=sdata, sdl=still_dl: self._apply_status_response(
+                    sd,
+                    update_status_msg=sdl or (not silent_completion_status),
+                )
+            )
+            if not still_dl:
+                break
+
+        if last_status.get("action_ok") is False:
+            return False
+        if last_status.get("all_downloaded") is not None:
+            return bool(last_status["all_downloaded"])
+        tot = int(last_status.get("total_count") or 0)
+        dl = int(last_status.get("downloaded_count") or 0)
+        return tot > 0 and dl >= tot
 
     def download_model_weights(self) -> None:
         base = self.normalized_base_url
@@ -1014,38 +1627,18 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
             self.state_changed.emit()
             return
 
-        target_model = self.selected_model_id
+        spec = self.active_model_spec
         self.is_downloading_weights = True
         self.model_task_progress = 0.01
         self.status_message = tr(
-            f"正在云端启动 8 线程极速下载 {self.active_model_spec.name} 权重...",
-            f"Starting 8-thread cloud download for {self.active_model_spec.name} weights...",
+            f"正在云端启动 8 线程极速下载 {spec.name} 权重...",
+            f"Starting 8-thread cloud download for {spec.name} weights...",
         )
         self.state_changed.emit()
 
         def worker() -> None:
             try:
-                r = self._admin_request("POST",
-                    f"{base}/minimax_api/download_model",
-                    json={"model_id": target_model, "hf_token": self.hf_token.strip()},
-                    timeout=60,
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    self._dispatch_ui(lambda: self._apply_status_response(data, update_status_msg=True))
-                while True:
-                    time.sleep(1.5)
-                    sr = self._admin_request("GET",
-                        f"{base}/minimax_api/status",
-                        params={"model_id": target_model},
-                        timeout=25,
-                    )
-                    if sr.status_code != 200:
-                        break
-                    sdata = sr.json()
-                    self._dispatch_ui(lambda sd=sdata: self._apply_status_response(sd, update_status_msg=True))
-                    if not sdata.get("is_downloading", False):
-                        break
+                self._run_download_weights_worker(base, spec, silent_completion_status=False)
             except Exception as exc:
                 msg = tr(f"下载权重请求异常：{exc}", f"Weight download request error: {exc}")
                 self._dispatch_ui(lambda: self._set_status_and_log(msg))
@@ -1059,46 +1652,95 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    start_remote_download_weights = download_model_weights
+
     def load_model_to_vram(self) -> None:
         base = self.normalized_base_url
         if not self.is_connected or not base:
             self.status_message = tr("请先连接或唤醒 Colab 云端实例。", "Please connect or wake a Colab cloud runtime first.")
             self.state_changed.emit()
             return
-        if not self.all_downloaded:
-            self.status_message = tr(
-                "请先点击「下载权重」将模型分片拉取到云盘/实例磁盘。",
-                "Please click 'Download Weights' to fetch model shards first.",
-            )
-            self.state_changed.emit()
-            return
 
-        target_model = self.selected_model_id
-        self.is_loading_model = True
-        self.model_task_progress = 0.05
-        self.status_message = tr(
-            f"正在将 {self.active_model_spec.name} 装载至云端 GPU 显存...",
-            f"Loading {self.active_model_spec.name} into cloud GPU VRAM...",
-        )
+        spec = self.active_model_spec
+        target_model = spec.id
+        needs_download = not self.all_downloaded
+
+        if needs_download:
+            self.is_auto_load_queued_after_download = True
+            self.is_downloading_weights = True
+            self.model_task_progress = 0.01
+            self.status_message = tr(
+                f"正在自动拉取 {spec.name} 权重，下载完成后将立即装载至 GPU 显存...",
+                f"Auto-downloading {spec.name} weights; will load into GPU VRAM right after...",
+            )
+        else:
+            self.is_auto_load_queued_after_download = False
+            self.is_loading_model = True
+            self.model_task_progress = 0.05
+            self.status_message = tr(
+                f"正在将 {spec.name} 装载至云端 GPU 显存...",
+                f"Loading {spec.name} into cloud GPU VRAM...",
+            )
         self.state_changed.emit()
 
-        payload = {
+        payload: Dict[str, Any] = {
             "model_id": target_model,
             "precision_mode": self.selected_precision,
             "offload_mode": self.selected_offload,
             "context_length": self.context_length_tokens,
             "hf_token": self.hf_token.strip(),
+            **self._build_custom_spec_fields(spec),
         }
 
         def worker() -> None:
             try:
+                if needs_download:
+                    dl_ok = self._run_download_weights_worker(
+                        base,
+                        spec,
+                        silent_completion_status=True,
+                    )
+                    if (
+                        not dl_ok
+                        or not self.is_connected
+                        or self.selected_model_id != target_model
+                    ):
+
+                        def abort_after_dl() -> None:
+                            self.is_downloading_weights = False
+                            self.is_auto_load_queued_after_download = False
+                            self.is_loading_model = False
+                            self.state_changed.emit()
+
+                        self._dispatch_ui(abort_after_dl)
+                        return
+
+                    def switch_to_load_stage() -> None:
+                        self.is_downloading_weights = False
+                        self.is_auto_load_queued_after_download = False
+                        self.is_loading_model = True
+                        self.model_task_progress = 0.05
+                        self.status_message = tr(
+                            f"权重已就绪，正在将 {spec.name} 装载至云端 GPU 显存...",
+                            f"Weights ready. Loading {spec.name} into cloud GPU VRAM...",
+                        )
+                        self.state_changed.emit()
+
+                    self._dispatch_ui(switch_to_load_stage)
+
                 r = self._admin_request("POST", f"{base}/minimax_api/load_model", json=payload, timeout=60)
                 if r.status_code == 200:
                     data = r.json()
-                    self._dispatch_ui(lambda: self._apply_status_response(data, update_status_msg=True))
+                    self._dispatch_ui(lambda d=data: self._apply_status_response(d, update_status_msg=True))
+                    if data.get("action_ok") is False:
+                        return
+                else:
+                    raise RuntimeError(f"HTTP {r.status_code}")
+
                 while True:
-                    time.sleep(1.5)
-                    sr = self._admin_request("GET",
+                    time.sleep(self._poll_interval_sec)
+                    sr = self._admin_request(
+                        "GET",
                         f"{base}/minimax_api/status",
                         params={"model_id": target_model},
                         timeout=25,
@@ -1107,7 +1749,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                         break
                     sdata = sr.json()
                     self._dispatch_ui(lambda sd=sdata: self._apply_status_response(sd, update_status_msg=True))
-                    if not sdata.get("is_loading_vram", False):
+                    if not sdata.get("is_loading_vram", False) and not sdata.get("is_downloading", False):
                         break
             except Exception as exc:
                 msg = tr(f"装载显存请求异常：{exc}", f"Load to VRAM request error: {exc}")
@@ -1115,12 +1757,16 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
             finally:
 
                 def done() -> None:
+                    self.is_downloading_weights = False
+                    self.is_auto_load_queued_after_download = False
                     self.is_loading_model = False
                     self.state_changed.emit()
 
                 self._dispatch_ui(done)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    load_remote_model_to_vram = load_model_to_vram
 
     def _clear_local_loaded_record(self, model_id: str) -> None:
         if model_id == "all":
@@ -1274,6 +1920,21 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
             if last_frame_b64:
                 payload["last_frame_base64"] = last_frame_b64
 
+        submitted_prompt_summary = prompt
+        if modality == ModelModality.VIDEO_AUDIO:
+            extra_parts: List[str] = []
+            if self.soundscape_prompt.strip():
+                extra_parts.append(f"[环境音效] {self.soundscape_prompt.strip()}")
+            if self.music_prompt.strip():
+                extra_parts.append(f"[配乐] {self.music_prompt.strip()}")
+            if extra_parts:
+                submitted_prompt_summary = "\n".join([prompt] + extra_parts)
+        submitted_neg_prompt = (
+            ""
+            if spec.id == "minimax_h3_image"
+            else self.negative_prompt.strip()
+        )
+
         self.status_message = tr(
             f"正在向云端提交 {spec.name} 推理任务...",
             f"Submitting {spec.name} inference job to cloud...",
@@ -1307,7 +1968,14 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                     return
 
                 job_id = str(job.get("job_id") or "")
-                self._poll_colab_job(base, job_id, token, assistant_idx)
+                self._poll_colab_job(
+                    base,
+                    job_id,
+                    token,
+                    assistant_idx,
+                    prompt_used=submitted_prompt_summary,
+                    negative_prompt_used=submitted_neg_prompt,
+                )
             except Exception as exc:
                 err_msg = tr(f"提交推理任务失败：{exc}", f"Failed to submit inference job: {exc}")
 
@@ -1326,7 +1994,15 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _download_media_to_local(self, base_url: str, rel_or_abs_url: str, filename: str, elapsed: Optional[float]) -> Optional[Path]:
+    def _download_media_to_local(
+        self,
+        base_url: str,
+        rel_or_abs_url: str,
+        filename: str,
+        elapsed: Optional[float],
+        prompt_used: Optional[str] = None,
+        negative_prompt_used: Optional[str] = None,
+    ) -> Optional[Path]:
         full_url = rel_or_abs_url if rel_or_abs_url.startswith("http") else f"{base_url}{rel_or_abs_url}"
         save_dir = get_local_save_dir()
         safe_name = Path(filename).name
@@ -1334,9 +2010,19 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         r = self._admin_request("GET", full_url, timeout=180)
         if r.status_code == 200 and r.content:
             dst.write_bytes(r.content)
-            if elapsed is not None and elapsed > 0:
-                self.media_elapsed_map[safe_name] = float(elapsed)
-                self._save_setting("mediaElapsedSecondsMap", self.media_elapsed_map)
+
+            def save_meta() -> None:
+                if elapsed is not None and elapsed > 0:
+                    self.media_elapsed_map[safe_name] = float(elapsed)
+                    self._save_setting("mediaElapsedSecondsMap", self.media_elapsed_map)
+                if prompt_used and prompt_used.strip():
+                    self.media_prompt_map[safe_name] = prompt_used.strip()
+                    self._save_setting("mediaPromptTextMap", self.media_prompt_map)
+                if negative_prompt_used and negative_prompt_used.strip():
+                    self.media_negative_prompt_map[safe_name] = negative_prompt_used.strip()
+                    self._save_setting("mediaNegativePromptTextMap", self.media_negative_prompt_map)
+
+            self._dispatch_ui(save_meta)
             return dst
         return None
 
@@ -1346,6 +2032,8 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         job_id: str,
         token: str,
         assistant_idx: Optional[int],
+        prompt_used: Optional[str] = None,
+        negative_prompt_used: Optional[str] = None,
     ) -> None:
         poll_interval = 0.6 if assistant_idx is not None else 1.0
         consecutive_404 = 0
@@ -1417,7 +2105,14 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                 el = float(item["elapsed"]) if item.get("elapsed") is not None else None
                 if fname and vurl and fname not in downloaded_filenames:
                     try:
-                        saved = self._download_media_to_local(base, vurl, fname, el)
+                        saved = self._download_media_to_local(
+                            base,
+                            vurl,
+                            fname,
+                            el,
+                            prompt_used=prompt_used,
+                            negative_prompt_used=negative_prompt_used,
+                        )
                         if saved:
                             downloaded_filenames.add(fname)
                             newly_saved.append((saved, el))
@@ -1431,7 +2126,14 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                 el = float(job["elapsed"]) if job.get("elapsed") is not None else None
                 if fname and vurl and fname not in downloaded_filenames:
                     try:
-                        saved = self._download_media_to_local(base, vurl, fname, el)
+                        saved = self._download_media_to_local(
+                            base,
+                            vurl,
+                            fname,
+                            el,
+                            prompt_used=prompt_used,
+                            negative_prompt_used=negative_prompt_used,
+                        )
                         if saved:
                             downloaded_filenames.add(fname)
                             newly_saved.append((saved, el))

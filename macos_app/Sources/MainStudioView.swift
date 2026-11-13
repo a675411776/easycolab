@@ -1147,7 +1147,7 @@ struct MainStudioView: View {
                     .background(RoundedRectangle(cornerRadius: 7).fill(Color.orange.opacity(0.10)))
                 }
 
-                if vm.isDownloadingWeights || vm.isLoadingModel {
+                if vm.isDownloadingWeights || vm.isLoadingModel || vm.isAutoLoadQueuedAfterDownload {
                     ProgressView(value: vm.modelTaskProgress, total: 1.0)
                 }
 
@@ -1168,26 +1168,28 @@ struct MainStudioView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .controlSize(.regular)
-                    .disabled(!vm.isConnected || vm.isDownloadingWeights || vm.isLoadingModel || vm.isUnloadingModel)
+                    .disabled(!vm.isConnected || vm.isDownloadingWeights || vm.isLoadingModel || vm.isAutoLoadQueuedAfterDownload || vm.isUnloadingModel)
 
                     Button {
                         Task { await vm.loadRemoteModelToVRAM() }
                     } label: {
                         HStack(spacing: 4) {
-                            if vm.isLoadingModel {
+                            if vm.isLoadingModel || vm.isAutoLoadQueuedAfterDownload {
                                 ProgressView().controlSize(.small)
                             } else {
                                 Image(systemName: "memorychip")
                             }
-                            Text(vm.isLoadingModel
-                                 ? L("装载中...", "Loading...")
-                                 : (vm.isSelectedModelLoadedInVRAM ? L("重新装载", "Reload") : L("加载到显存", "Load to VRAM")))
+                            Text(vm.isAutoLoadQueuedAfterDownload
+                                 ? L("下载并装载...", "DL & Load...")
+                                 : (vm.isLoadingModel
+                                    ? L("装载中...", "Loading...")
+                                    : (vm.isSelectedModelLoadedInVRAM ? L("重新装载", "Reload") : L("加载到显存", "Load to VRAM"))))
                         }
                         .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.regular)
-                    .disabled(!vm.isConnected || vm.isDownloadingWeights || vm.isLoadingModel || vm.isUnloadingModel)
+                    .disabled(!vm.isConnected || vm.isDownloadingWeights || vm.isLoadingModel || vm.isAutoLoadQueuedAfterDownload || vm.isUnloadingModel)
 
                     if vm.isSelectedModelLoadedInVRAM {
                         Button {
@@ -1459,12 +1461,13 @@ struct MainStudioView: View {
             .disabled(vm.chatHistory.isEmpty || vm.isGenerating)
 
         case .image:
+            let activeResolutions = vm.selectedModelId == "minimax_h3_image" ? MINIMAX_H3_IMAGE_RESOLUTIONS : IMAGE_RESOLUTIONS
             VStack(alignment: .leading, spacing: 4) {
                 Text(L("输出画幅", "Output Aspect & Resolution"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Picker(L("画幅", "Resolution"), selection: $vm.selectedImageResolution) {
-                    ForEach(IMAGE_RESOLUTIONS) { opt in
+                    ForEach(activeResolutions) { opt in
                         Text(opt.label).tag(opt)
                     }
                 }

@@ -44,10 +44,12 @@ from PySide6.QtWidgets import (
     QMainWindow,
 )
 
+from windows_app.local_api_gateway import VIRTUAL_MODEL_ID as LOCAL_GATEWAY_VIRTUAL_MODEL_ID
 from windows_app.models import (
     COMFY_WEIGHT_SUBFOLDERS,
     GPU_CHOICES,
     IMAGE_RESOLUTIONS,
+    MINIMAX_H3_IMAGE_RESOLUTIONS,
     MODEL_SPEC_MAP,
     OPEN_MODEL_CATALOG,
     PRESET_TEMPLATES,
@@ -585,6 +587,106 @@ class WorkspaceMixin:
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(14)
 
+        # Card 0: Local Fixed Reverse Proxy (`127.0.0.1:8787`) — Configure External Tools Once
+        gw_trail = QWidget()
+        gt_lay = QHBoxLayout(gw_trail)
+        gt_lay.setContentsMargins(0, 0, 0, 0)
+        gt_lay.setSpacing(6)
+        self.local_gw_dot = StatusDot("#10B981" if self.vm.local_gateway_running else "#64748B", 7)
+        gt_lay.addWidget(self.local_gw_dot)
+        self.local_gw_status_lbl = QLabel("")
+        self.local_gw_status_lbl.setStyleSheet(
+            "font-size: 11px; font-weight: 700; font-family: Consolas, monospace; color: #10B981;"
+        )
+        gt_lay.addWidget(self.local_gw_status_lbl)
+        self.local_gw_fwd_lbl = QLabel("")
+        self.local_gw_fwd_lbl.setStyleSheet(
+            "font-size: 11px; color: #64748B; font-family: Consolas, monospace;"
+        )
+        gt_lay.addWidget(self.local_gw_fwd_lbl)
+
+        local_gw_card = WorkspaceCard(
+            tr(
+                "本机固定反向代理（推荐 · 外部工具一次配置永久免改）",
+                "Local Fixed Reverse Proxy (Recommended · Configure External Tools Once)",
+            ),
+            tr(
+                "固定监听本机端口，自动注入云端最新隧道地址、API Key 与当前显存模型 —— Magpie / Claude Code / Codex / Cursor 永远无需重填",
+                "Binds a fixed localhost port and auto-injects your active Colab tunnel URL, API Key & loaded model — zero reconfiguration across restarts",
+            ),
+            trailing=gw_trail,
+        )
+
+        gw_ctrl = QHBoxLayout()
+        gw_ctrl.setSpacing(8)
+        self.local_gw_chk = QCheckBox(
+            tr("随客户端启动本机固定代理", "Enable Local Fixed Proxy")
+        )
+        self.local_gw_chk.setChecked(self.vm.local_gateway_enabled)
+        self.local_gw_chk.toggled.connect(self._on_local_gw_toggled)
+        gw_ctrl.addWidget(self.local_gw_chk)
+
+        gw_ctrl.addSpacing(8)
+        gw_ctrl.addWidget(QLabel(tr("端口", "Port")))
+        self.local_gw_port_input = QLineEdit(str(self.vm.local_gateway_port))
+        self.local_gw_port_input.setFixedWidth(74)
+        self.local_gw_port_input.setStyleSheet("font-family: Consolas, monospace;")
+        self.local_gw_port_input.returnPressed.connect(self._on_local_gw_apply_port)
+        gw_ctrl.addWidget(self.local_gw_port_input)
+
+        apply_port_btn = QPushButton(tr("应用", "Apply"))
+        apply_port_btn.setFixedHeight(26)
+        apply_port_btn.clicked.connect(self._on_local_gw_apply_port)
+        gw_ctrl.addWidget(apply_port_btn)
+
+        gw_ctrl.addStretch(1)
+        copy_magpie_btn = set_btn_role(
+            QPushButton(tr("复制 Magpie 配置", "Copy Magpie Config")),
+            "primary",
+        )
+        copy_magpie_btn.setFixedHeight(28)
+        copy_magpie_btn.clicked.connect(self._copy_magpie_config)
+        gw_ctrl.addWidget(copy_magpie_btn)
+        local_gw_card.body.addLayout(gw_ctrl)
+
+        self.local_gw_err_lbl = QLabel("")
+        self.local_gw_err_lbl.setWordWrap(True)
+        self.local_gw_err_lbl.setStyleSheet("color: #EF4444; font-size: 11px;")
+        self.local_gw_err_lbl.setVisible(False)
+        local_gw_card.body.addWidget(self.local_gw_err_lbl)
+
+        self.local_gw_info_box = QFrame()
+        self.local_gw_info_box.setObjectName("SubtlePanel")
+        gi_lay = QVBoxLayout(self.local_gw_info_box)
+        gi_lay.setContentsMargins(10, 8, 10, 8)
+        gi_lay.setSpacing(5)
+        self.local_gw_oai_lbl = self._add_endpoint_copy_row(
+            gi_lay,
+            "OpenAI Base",
+            lambda: self.vm.local_gateway_v1_url,
+        )
+        self.local_gw_ant_lbl = self._add_endpoint_copy_row(
+            gi_lay,
+            "Anthropic",
+            lambda: self.vm.local_gateway_base_url,
+        )
+        self.local_gw_key_lbl = self._add_endpoint_copy_row(
+            gi_lay,
+            "API Key",
+            lambda: "sk-easycolab",
+        )
+        self.local_gw_model_lbl = self._add_endpoint_copy_row(
+            gi_lay,
+            tr("推荐模型名", "Model ID"),
+            lambda: LOCAL_GATEWAY_VIRTUAL_MODEL_ID,
+        )
+        self.local_gw_route_lbl = QLabel("")
+        self.local_gw_route_lbl.setWordWrap(True)
+        self.local_gw_route_lbl.setStyleSheet("font-size: 11px; color: #64748B;")
+        gi_lay.addWidget(self.local_gw_route_lbl)
+        local_gw_card.body.addWidget(self.local_gw_info_box)
+        lay.addWidget(local_gw_card)
+
         self.api_req_count_lbl = QLabel(tr("累计 API 请求: 0 次", "Total API Requests: 0"))
         self.api_req_count_lbl.setStyleSheet(
             "font-size: 11.5px; font-weight: 600; color: #64748B; font-family: Consolas, monospace;"
@@ -795,10 +897,10 @@ class WorkspaceMixin:
         lay.setSpacing(14)
 
         self.img_refs_card = WorkspaceCard(
-            tr("指令修图 / 风格重绘参考图", "Instruction Edit / Img2Img Reference Images"),
+            tr("指令修图 / 空间多视角参考图", "Instruction & Spatial Multi-Image Reference"),
             tr(
-                "上传原图后输入自然语言修改指令（Qwen-Image-2.1 支持双图主体融合）",
-                "Upload source image(s) and enter natural-language edit instructions (Qwen-Image-2.1 supports dual-image fusion)",
+                "上传原图后输入自然语言修改指令（MiniMax-H3-Image 与 Qwen-Image-2.1 均支持 1~2 张参考图空间修图与主体融合）",
+                "Upload source image(s) and enter edit instructions (MiniMax-H3-Image & Qwen-Image-2.1 support 1–2 reference images)",
             ),
         )
         r_row = QHBoxLayout()
@@ -835,7 +937,22 @@ class WorkspaceMixin:
         self.img_visual_edit.textChanged.connect(self._on_img_visual_edited)
         p_card.body.addWidget(self.img_visual_edit)
 
-        p_card.body.addWidget(
+        self.img_mh3_hint_lbl = QLabel(
+            tr(
+                "MiniMax-H3-Image 采用 6 步零 CFG 架构并内置 Heretic 7.5GB 破甲提示词扩写器，无需填写反向提示词，中英文简短提示词亦可自动扩写为摄影级细节。",
+                "MiniMax-H3-Image uses a 6-step zero-CFG architecture with built-in Heretic 7.5GB uncensored prompt upsampler — no negative prompt needed.",
+            )
+        )
+        self.img_mh3_hint_lbl.setWordWrap(True)
+        self.img_mh3_hint_lbl.setStyleSheet("font-size: 11px; color: #059669;")
+        self.img_mh3_hint_lbl.setVisible(False)
+        p_card.body.addWidget(self.img_mh3_hint_lbl)
+
+        self.img_neg_box = QWidget()
+        nb_lay = QVBoxLayout(self.img_neg_box)
+        nb_lay.setContentsMargins(0, 0, 0, 0)
+        nb_lay.setSpacing(4)
+        nb_lay.addWidget(
             QLabel(
                 tr(
                     "反向提示词 Negative Prompt（可选，排除低质或多余元素）",
@@ -854,7 +971,8 @@ class WorkspaceMixin:
         self.img_neg_edit.textChanged.connect(
             lambda: setattr(self.vm, "negative_prompt", self.img_neg_edit.toPlainText())
         )
-        p_card.body.addWidget(self.img_neg_edit)
+        nb_lay.addWidget(self.img_neg_edit)
+        p_card.body.addWidget(self.img_neg_box)
 
         p_card.body.addLayout(self._build_generate_action_bar("img"))
         lay.addWidget(p_card)
@@ -894,17 +1012,68 @@ class WorkspaceMixin:
         hbox.setContentsMargins(0, 0, 0, 0)
         hbox.setSpacing(14)
 
-        self.media_preview = MediaPreviewWidget()
-        hbox.addWidget(self.media_preview, 1)
+        left_col = QWidget()
+        left_vbox = QVBoxLayout(left_col)
+        left_vbox.setContentsMargins(0, 0, 0, 0)
+        left_vbox.setSpacing(8)
 
-        # Right side stack: Page 0 = Local Media Gallery (254px), Page 1 = ComfyUI Cloud Outputs + Local (290px)
+        self.media_preview = MediaPreviewWidget()
+        left_vbox.addWidget(self.media_preview, 1)
+
+        # Selected media generation prompt bar (visible when selected item has prompt_text)
+        self.media_prompt_box = QFrame()
+        self.media_prompt_box.setObjectName("SubtlePanel")
+        mp_lay = QVBoxLayout(self.media_prompt_box)
+        mp_lay.setContentsMargins(10, 7, 10, 7)
+        mp_lay.setSpacing(4)
+        mp_hdr = QHBoxLayout()
+        mp_title = QLabel(tr("生成提示词记录 (Prompt)", "Generation Prompt"))
+        mp_title.setStyleSheet("font-size: 11px; font-weight: 700; color: #64748B;")
+        mp_hdr.addWidget(mp_title)
+        mp_hdr.addStretch(1)
+        mp_reuse_btn = set_btn_role(QPushButton(tr("回填到输入框", "Reuse Prompt")), "ghost")
+        mp_reuse_btn.setFixedHeight(22)
+        mp_reuse_btn.clicked.connect(self._reuse_selected_media_prompt)
+        mp_copy_btn = set_btn_role(QPushButton(tr("复制提示词", "Copy Prompt")), "ghost")
+        mp_copy_btn.setFixedHeight(22)
+        mp_copy_btn.clicked.connect(self._copy_selected_media_prompt)
+        mp_hdr.addWidget(mp_reuse_btn)
+        mp_hdr.addWidget(mp_copy_btn)
+        mp_lay.addLayout(mp_hdr)
+
+        self.media_prompt_val_lbl = QLabel("")
+        self.media_prompt_val_lbl.setWordWrap(True)
+        self.media_prompt_val_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.media_prompt_val_lbl.setStyleSheet("font-size: 11.5px; line-height: 1.35;")
+        mp_lay.addWidget(self.media_prompt_val_lbl)
+        self.media_prompt_box.setVisible(False)
+        left_vbox.addWidget(self.media_prompt_box)
+
+        hbox.addWidget(left_col, 1)
+
+        # Right side stack: Page 0 = Local Media Gallery (268px), Page 1 = ComfyUI Cloud Outputs (268px)
         self.right_gallery_stack = QStackedWidget()
         self.right_gallery_stack.setFixedWidth(268)
 
         # Page 0: Local History Gallery
+        gal_hdr_btns = QWidget()
+        gh_lay = QHBoxLayout(gal_hdr_btns)
+        gh_lay.setContentsMargins(0, 0, 0, 0)
+        gh_lay.setSpacing(4)
+        ref_gal_btn = set_btn_role(QPushButton(tr("刷新", "Refresh")), "ghost")
+        ref_gal_btn.setFixedHeight(22)
+        ref_gal_btn.clicked.connect(lambda: self.vm.refresh_local_media_gallery(auto_select_first=False))
+        self.clear_gallery_btn = set_btn_role(QPushButton(tr("清空", "Clear")), "ghost")
+        self.clear_gallery_btn.setFixedHeight(22)
+        self.clear_gallery_btn.setStyleSheet("color: #EF4444; font-size: 11px;")
+        self.clear_gallery_btn.clicked.connect(self._confirm_clear_local_media)
+        gh_lay.addWidget(ref_gal_btn)
+        gh_lay.addWidget(self.clear_gallery_btn)
+
         loc_card = WorkspaceCard(
             tr("本机成片库", "Local Media Library"),
             tr("自动保存至 Videos/EasyColab", "Auto-saved to Videos/EasyColab"),
+            trailing=gal_hdr_btns,
         )
         loc_scroll = QScrollArea()
         loc_scroll.setWidgetResizable(True)
@@ -1475,21 +1644,49 @@ class WorkspaceMixin:
         hl.addWidget(pull_b)
         return f
 
-    def _api_snippets(self) -> Dict[str, str]:
-        base_host = self.vm.normalized_base_url or "https://xxxx.gradio.live"
-        shown_host = self.vm.masked_url(base_host)
-        oai_base_real = f"{base_host}/v1"
-        oai_base_shown = f"{shown_host}/v1"
-        key = self.vm.api_access_key if self.vm.api_key_enabled else "sk-no-key-required"
+    def _on_local_gw_toggled(self, checked: bool) -> None:
+        if getattr(self, "_syncing_ui", False):
+            return
+        self.vm.set_local_gateway_enabled(checked)
 
-        if self.vm.selected_model_id == "qwen38_27b_gguf":
-            repo = "unsloth/Qwen3.8-27B-GGUF"
-        elif self.vm.selected_model_id == "qwen38_27b":
-            repo = "Qwen/Qwen3.8-27B"
-        elif "qwen38_27b_gguf" in self.vm.loaded_model_ids and "qwen38_27b" not in self.vm.loaded_model_ids:
-            repo = "unsloth/Qwen3.8-27B-GGUF"
+    def _on_local_gw_apply_port(self) -> None:
+        self.vm.apply_local_gateway_port(self.local_gw_port_input.text())
+
+    def _copy_magpie_config(self) -> None:
+        oai_url = self.vm.local_gateway_v1_url
+        ant_url = self.vm.local_gateway_base_url
+        cfg_txt = (
+            f"OpenAI Base URL: {oai_url}\n"
+            f"Anthropic Base URL: {ant_url}\n"
+            "API Key: sk-easycolab\n"
+            f"Model: {LOCAL_GATEWAY_VIRTUAL_MODEL_ID}"
+        )
+        self._copy_text(
+            cfg_txt,
+            tr(
+                f"已复制本机固定代理配置 ({oai_url} · {LOCAL_GATEWAY_VIRTUAL_MODEL_ID})。",
+                f"Copied local fixed proxy config ({oai_url} · {LOCAL_GATEWAY_VIRTUAL_MODEL_ID}).",
+            ),
+        )
+
+    def _api_snippets(self) -> Dict[str, str]:
+        use_local = bool(self.vm.local_gateway_enabled and self.vm.local_gateway_running)
+        llm_spec = self.vm.active_gateway_llm_model_spec
+
+        if use_local:
+            base_host = self.vm.local_gateway_base_url
+            shown_host = base_host
+            oai_base_real = self.vm.local_gateway_v1_url
+            oai_base_shown = oai_base_real
+            key = "sk-easycolab"
+            repo = LOCAL_GATEWAY_VIRTUAL_MODEL_ID
         else:
-            repo = "Qwen/Qwen3.8-27B"
+            base_host = self.vm.normalized_base_url or "https://xxxx.gradio.live"
+            shown_host = self.vm.masked_url(base_host)
+            oai_base_real = f"{base_host}/v1"
+            oai_base_shown = f"{shown_host}/v1"
+            key = self.vm.api_access_key if self.vm.api_key_enabled else "sk-no-key-required"
+            repo = llm_spec.repo_id
 
         py_msg = tr("帮我设计一个高并发网关架构", "Design a high-concurrency API gateway architecture")
         oai_curl_msg = tr("用三句话解释量子纠缠", "Explain quantum entanglement in three sentences")
@@ -1566,6 +1763,56 @@ class WorkspaceMixin:
 
     def _refresh_api_gateway_cards(self) -> None:
         sn = self._api_snippets()
+        llm_spec = self.vm.active_gateway_llm_model_spec
+
+        # Refresh Local Fixed Reverse Proxy card
+        self.local_gw_chk.setChecked(self.vm.local_gateway_enabled)
+        if not self.local_gw_port_input.hasFocus():
+            self.local_gw_port_input.setText(str(self.vm.local_gateway_port))
+
+        if self.vm.local_gateway_running:
+            port = self.vm.local_gateway_bound_port or self.vm.local_gateway_port
+            self.local_gw_dot.set_color("#10B981")
+            self.local_gw_status_lbl.setText(
+                tr(f"运行中 · 127.0.0.1:{port}", f"Running · 127.0.0.1:{port}")
+            )
+            self.local_gw_status_lbl.setStyleSheet(
+                "font-size: 11px; font-weight: 700; font-family: Consolas, monospace; color: #10B981;"
+            )
+        elif not self.vm.local_gateway_enabled:
+            self.local_gw_dot.set_color("#64748B")
+            self.local_gw_status_lbl.setText(tr("已关闭", "Disabled"))
+            self.local_gw_status_lbl.setStyleSheet(
+                "font-size: 11px; font-weight: 700; font-family: Consolas, monospace; color: #64748B;"
+            )
+        else:
+            self.local_gw_dot.set_color("#F59E0B")
+            self.local_gw_status_lbl.setText(tr("端口异常", "Port Error"))
+            self.local_gw_status_lbl.setStyleSheet(
+                "font-size: 11px; font-weight: 700; font-family: Consolas, monospace; color: #F59E0B;"
+            )
+
+        self.local_gw_fwd_lbl.setText(
+            tr(
+                f"· 本地转发: {self.vm.local_gateway_request_count} 次",
+                f"· Forwarded: {self.vm.local_gateway_request_count}",
+            )
+        )
+        has_gw_err = bool(self.vm.local_gateway_error)
+        self.local_gw_err_lbl.setVisible(has_gw_err)
+        if has_gw_err:
+            self.local_gw_err_lbl.setText(self.vm.local_gateway_error)
+
+        self.local_gw_info_box.setVisible(self.vm.local_gateway_enabled)
+        self.local_gw_oai_lbl.setText(self.vm.local_gateway_v1_url)
+        self.local_gw_ant_lbl.setText(self.vm.local_gateway_base_url)
+        self.local_gw_route_lbl.setText(
+            tr(
+                f"当前自动路由目标：{llm_spec.name} ({llm_spec.repo_id}) · 任意非空 API Key 均自动替换为云端真实密钥，模型名填 {LOCAL_GATEWAY_VIRTUAL_MODEL_ID} 换模型零改动。",
+                f"Active auto-route target: {llm_spec.name} ({llm_spec.repo_id}) · Any non-empty API Key is replaced with your cloud key; use model '{LOCAL_GATEWAY_VIRTUAL_MODEL_ID}' for zero-config switching.",
+            )
+        )
+
         self.api_req_count_lbl.setText(
             tr(f"累计 API 请求: {self.vm.api_request_count} 次", f"Total API Requests: {self.vm.api_request_count}")
         )
@@ -1574,7 +1821,7 @@ class WorkspaceMixin:
         if not self.api_key_input.hasFocus():
             self.api_key_input.setText(self.vm.api_access_key)
 
-        disp_name = "Qwen3.8-27B-GGUF" if "GGUF" in sn["repo"] else "Qwen3.8-27B"
+        disp_name = llm_spec.name
         if not self.vm.is_qwen_loaded_in_vram:
             self.api_coresident_hint.setText(
                 tr(

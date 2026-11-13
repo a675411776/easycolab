@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, QUrl, Qt
 from PySide6.QtGui import QAction, QFontMetrics, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,6 +48,7 @@ from windows_app.models import (
     COMFY_WEIGHT_SUBFOLDERS,
     GPU_CHOICES,
     IMAGE_RESOLUTIONS,
+    MINIMAX_H3_IMAGE_RESOLUTIONS,
     MODEL_SPEC_MAP,
     OPEN_MODEL_CATALOG,
     PRESET_TEMPLATES,
@@ -55,8 +56,10 @@ from windows_app.models import (
     VIDEO_RESOLUTIONS,
     ComfyOutputMediaItem,
     ComfyPresetPackItem,
+    LocalMediaItem,
     ModelModality,
     OpenModelSpec,
+    ResolutionOption,
     format_duration,
     format_uptime_hms,
     get_idle_timeout_choices,
@@ -160,6 +163,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
 
         self._apply_theme()
         self._refresh_all_state()
+        self._refresh_api_gateway_cards()
         self._refresh_telemetry()
         self._refresh_console()
         self._refresh_media_gallery()
@@ -195,6 +199,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
             else self.llm_prompt_edit.toPlainText()
         )
         api_key_txt = self.api_key_input.text()
+        local_gw_port_txt = self.local_gw_port_input.text()
         shards_expanded = bool(getattr(self.shards_box, "_expanded", False))
         cur_media = self.vm.current_media_path
 
@@ -207,6 +212,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         self._last_modes_sig = None
         self._last_packs_sig = None
         self._last_cfy_out_sig = None
+        self._last_img_res_sig = None
 
         # 4. Update window title
         self.setWindowTitle(
@@ -249,6 +255,8 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         self.llm_prompt_edit.setPlainText(llm_txt)
         if api_key_txt:
             self.api_key_input.setText(api_key_txt)
+        if local_gw_port_txt:
+            self.local_gw_port_input.setText(local_gw_port_txt)
         self.shards_box.set_expanded(shards_expanded)
         self._syncing_ui = False
 
@@ -258,6 +266,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
 
         self._apply_theme()
         self._refresh_all_state()
+        self._refresh_api_gateway_cards()
         self._refresh_telemetry()
         self._refresh_console()
         self._refresh_chat_conversation()
@@ -265,6 +274,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         if cur_media is not None and cur_media.exists():
             el = self.vm.media_elapsed_map.get(cur_media.name)
             self.media_preview.load_media(cur_media, elapsed_seconds=el, auto_play=False)
+        self._refresh_selected_media_prompt_box()
 
     def _apply_theme(self) -> None:
         pal = self.palette_obj
@@ -1180,9 +1190,33 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         self.vm.inference_steps = snapped
         self.vid_steps_lbl.setText(tr(f"{snapped} 步", f"{snapped} steps"))
 
+    def _active_image_resolutions(self) -> List[ResolutionOption]:
+        if self.vm.selected_model_id == "minimax_h3_image":
+            return MINIMAX_H3_IMAGE_RESOLUTIONS
+        return IMAGE_RESOLUTIONS
+
+    def _sync_img_res_combo(self) -> None:
+        res_list = self._active_image_resolutions()
+        sig = (get_lang(), tuple(r.id for r in res_list))
+        if getattr(self, "_last_img_res_sig", None) != sig:
+            self._last_img_res_sig = sig
+            self.img_res_combo.blockSignals(True)
+            self.img_res_combo.clear()
+            for r in res_list:
+                self.img_res_combo.addItem(r.label, r.id)
+            self.img_res_combo.blockSignals(False)
+        cur_idx = self.img_res_combo.findData(self.vm.selected_image_res.id)
+        if cur_idx >= 0 and self.img_res_combo.currentIndex() != cur_idx:
+            self.img_res_combo.blockSignals(True)
+            self.img_res_combo.setCurrentIndex(cur_idx)
+            self.img_res_combo.blockSignals(False)
+
     def _on_img_res_changed(self, idx: int) -> None:
-        if 0 <= idx < len(IMAGE_RESOLUTIONS):
-            self.vm.selected_image_res = IMAGE_RESOLUTIONS[idx]
+        if self._syncing_ui:
+            return
+        res_list = self._active_image_resolutions()
+        if 0 <= idx < len(res_list):
+            self.vm.selected_image_res = res_list[idx]
 
     def _on_img_steps_changed(self, val: int) -> None:
         self.vm.inference_steps = int(val)
@@ -1296,7 +1330,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
             self.vm.visual_prompt = self.img_visual_edit.toPlainText()
             if self.vm.task_mode_id == "i2i_edit":
                 first_b64 = self.img_ref1_well.to_jpeg_base64()
-                if spec.id == "qwen_image_21":
+                if spec.id in ("qwen_image_21", "minimax_h3_image"):
                     last_b64 = self.img_ref2_well.to_jpeg_base64()
 
         self.vm.start_generation(first_frame_b64=first_b64, last_frame_b64=last_b64)
@@ -1528,10 +1562,10 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
 
             self._rebuild_shards_list()
 
-            # KV mismatch check for Qwen GGUF
+            # KV mismatch check for GGUF / LLM models
             loaded_k = self.vm.loaded_context_length // 1024
             if (
-                spec.id == "qwen38_27b_gguf"
+                (spec.id == "qwen38_27b_gguf" or (spec.is_custom and spec.modality == ModelModality.LLM_VLM))
                 and self.vm.is_selected_model_loaded_in_vram
                 and loaded_k > 0
                 and loaded_k != self.vm.context_length_k
@@ -1551,7 +1585,11 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
                 tr("一键唤醒", "1-Click Wake") if self.vm.cli_logged_in else tr("重连", "Reconnect")
             )
 
-            busy_w = self.vm.is_downloading_weights or self.vm.is_loading_model
+            busy_w = (
+                self.vm.is_downloading_weights
+                or self.vm.is_loading_model
+                or self.vm.is_auto_load_queued_after_download
+            )
             self.weight_prog_bar.setVisible(busy_w)
             self.weight_prog_bar.setValue(int(self.vm.model_task_progress * 100))
 
@@ -1560,12 +1598,16 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
             )
             self.dl_weights_btn.setEnabled(self.vm.is_connected and not busy_w)
 
-            self.load_vram_btn.setText(
-                tr("重新装载", "Reload VRAM")
-                if self.vm.is_selected_model_loaded_in_vram
-                else tr("加载到显存", "Load to VRAM")
-            )
-            self.load_vram_btn.setEnabled(self.vm.is_connected and self.vm.all_downloaded and not busy_w)
+            if self.vm.is_auto_load_queued_after_download:
+                load_lbl = tr("下载并装载...", "DL & Load...")
+            elif self.vm.is_loading_model:
+                load_lbl = tr("装载中...", "Loading...")
+            elif self.vm.is_selected_model_loaded_in_vram:
+                load_lbl = tr("重新装载", "Reload VRAM")
+            else:
+                load_lbl = tr("加载到显存", "Load to VRAM")
+            self.load_vram_btn.setText(load_lbl)
+            self.load_vram_btn.setEnabled(self.vm.is_connected and not busy_w)
             self.eject_vram_btn.setVisible(self.vm.is_selected_model_loaded_in_vram)
 
         # 4. Adaptive Params Card
@@ -1577,7 +1619,8 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         elif spec.modality == ModelModality.IMAGE:
             self.params_card.title_label.setText(tr("规格与采样参数", "Resolution & Sampling"))
             self.params_stack.setCurrentIndex(1)
-            self.img_steps_slider.setValue(self.vm.inference_steps)
+            self._sync_img_res_combo()
+            self.img_steps_slider.setValue(max(4, min(50, self.vm.inference_steps)))
             self.img_steps_lbl.setText(tr(f"{self.vm.inference_steps} 步", f"{self.vm.inference_steps} steps"))
             self.denoise_box.setVisible(spec.id == "z_image_turbo" and self.vm.task_mode_id == "i2i_edit")
         elif spec.modality == ModelModality.LLM_VLM:
@@ -1679,7 +1722,9 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         elif spec.modality == ModelModality.IMAGE:
             self.studio_stack.setCurrentIndex(3)
             self.img_refs_card.setVisible(self.vm.task_mode_id == "i2i_edit")
-            self.img_ref2_well.setVisible(spec.id == "qwen_image_21")
+            self.img_ref2_well.setVisible(spec.id in ("qwen_image_21", "minimax_h3_image"))
+            self.img_neg_box.setVisible(spec.id != "minimax_h3_image")
+            self.img_mh3_hint_lbl.setVisible(spec.id == "minimax_h3_image")
             self.shared_media_split.setVisible(True)
             self.right_gallery_stack.setCurrentIndex(0)
             self._update_gen_bar(
@@ -1698,6 +1743,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
             self.vm.is_generating
             or self.vm.is_downloading_weights
             or self.vm.is_loading_model
+            or self.vm.is_auto_load_queued_after_download
             or self.vm.is_waking_colab
             or self.vm.comfy_starting
             or self.vm.comfy_downloading_weight
@@ -1713,7 +1759,11 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         if self.vm.is_generating:
             self.log_task_prog.setVisible(True)
             self.log_task_prog.setValue(int(self.vm.progress_value * 100))
-        elif self.vm.is_downloading_weights or self.vm.is_loading_model:
+        elif (
+            self.vm.is_downloading_weights
+            or self.vm.is_loading_model
+            or self.vm.is_auto_load_queued_after_download
+        ):
             self.log_task_prog.setVisible(True)
             self.log_task_prog.setValue(int(self.vm.model_task_progress * 100))
         else:
@@ -2018,26 +2068,157 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
 
     def _refresh_media_gallery(self) -> None:
         self._clear_layout(self.local_gallery_lay)
-        if not self.vm.local_media_items:
+        has_items = bool(self.vm.local_media_items)
+        if hasattr(self, "clear_gallery_btn"):
+            self.clear_gallery_btn.setVisible(has_items)
+
+        if not has_items:
             empty = QLabel(tr("本地目录暂无历史作品", "No local outputs yet"))
             empty.setStyleSheet("color: #64748B; font-size: 11.5px; padding: 12px;")
             self.local_gallery_lay.addWidget(empty)
         else:
+            pal = self.palette_obj
             for item in self.vm.local_media_items[:60]:
+                row_w = QWidget()
+                row_lay = QHBoxLayout(row_w)
+                row_lay.setContentsMargins(0, 0, 0, 0)
+                row_lay.setSpacing(4)
+
                 ic = tr("[图片]", "[Img]") if item.is_image else tr("[视频]", "[Vid]")
                 ts_str = datetime.fromtimestamp(item.created_ts).strftime("%m-%d %H:%M") if item.created_ts > 0 else ""
                 el_str = f" · {format_duration(item.elapsed_seconds, compact=True)}" if item.elapsed_seconds else ""
-                btn = QPushButton(f"{ic} {item.filename[:22]}\n{ts_str}{el_str}")
+                prompt_snip = ""
+                if item.prompt_text:
+                    single_line = " ".join(item.prompt_text.split())
+                    prompt_snip = "\n" + (single_line[:24] + "…" if len(single_line) > 24 else single_line)
+
+                btn = QPushButton(f"{ic} {item.filename[:20]}\n{ts_str}{el_str}{prompt_snip}")
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn.setStyleSheet("QPushButton { text-align: left; padding: 6px 8px; font-size: 11px; }")
+                is_cur = self.vm.current_media_path == item.path
+                if is_cur:
+                    btn.setStyleSheet(
+                        f"QPushButton {{ text-align: left; padding: 6px 8px; font-size: 11px; "
+                        f"background-color: {pal.selected_card_bg}; border: 1.5px solid {pal.selected_card_border}; border-radius: 7px; }}"
+                    )
+                else:
+                    btn.setStyleSheet("QPushButton { text-align: left; padding: 6px 8px; font-size: 11px; }")
+                if item.prompt_text:
+                    btn.setToolTip(item.prompt_text)
                 btn.clicked.connect(lambda _c=False, p=item.path: self.vm.select_local_media(p, auto_play=True))
-                self.local_gallery_lay.addWidget(btn)
+                btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                btn.customContextMenuRequested.connect(
+                    lambda pos, b=btn, it=item: self._show_media_item_menu(b, pos, it)
+                )
+                row_lay.addWidget(btn, 1)
+
+                del_btn = set_btn_role(QPushButton("×"), "ghost")
+                del_btn.setFixedSize(24, 24)
+                del_btn.setToolTip(tr("删除该条本地记录", "Delete this local media item"))
+                del_btn.setStyleSheet("color: #94A3B8; font-size: 13px; font-weight: 700;")
+                del_btn.clicked.connect(lambda _c=False, p=item.path: self.vm.delete_local_media(p))
+                row_lay.addWidget(del_btn, 0, Qt.AlignmentFlag.AlignTop)
+
+                self.local_gallery_lay.addWidget(row_w)
         self.local_gallery_lay.addStretch(1)
+        self._refresh_selected_media_prompt_box()
+
+    def _show_media_item_menu(self, btn: QPushButton, pos: object, item: LocalMediaItem) -> None:
+        menu = QMenu(self)
+        act_open = QAction(tr("用默认程序打开", "Open in Default App"), self)
+        act_open.triggered.connect(lambda: open_path_in_os(item.path, reveal=False))
+        menu.addAction(act_open)
+
+        act_rev = QAction(
+            tr("在文件夹中显示", "Show in Explorer" if hasattr(QApplication, "instance") else "Reveal in Folder"),
+            self,
+        )
+        act_rev.triggered.connect(lambda: open_path_in_os(item.path, reveal=True))
+        menu.addAction(act_rev)
+
+        if item.prompt_text:
+            act_cp = QAction(tr("复制生成提示词", "Copy Prompt"), self)
+            act_cp.triggered.connect(
+                lambda: self._copy_text(
+                    item.prompt_text or "",
+                    tr("已复制该成片的提示词。", "Copied media prompt to clipboard."),
+                )
+            )
+            menu.addAction(act_cp)
+
+        menu.addSeparator()
+        act_del = QAction(tr("删除该记录文件", "Delete File"), self)
+        act_del.triggered.connect(lambda: self.vm.delete_local_media(item.path))
+        menu.addAction(act_del)
+        menu.exec(btn.mapToGlobal(pos))  # type: ignore[arg-type]
+
+    def _confirm_clear_local_media(self) -> None:
+        cnt = len(self.vm.local_media_items)
+        if cnt <= 0:
+            return
+        ans = QMessageBox.question(
+            self,
+            tr("清空本机成片库", "Clear Local Media Library"),
+            tr(
+                f"确定要删除本地成片库中的全部 {cnt} 项历史作品文件吗？",
+                f"Delete all {cnt} local media files in your EasyColab output folder?",
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self.vm.clear_all_local_media()
+
+    def _refresh_selected_media_prompt_box(self) -> None:
+        if not hasattr(self, "media_prompt_box"):
+            return
+        item = self.vm.current_selected_media_item
+        if item is not None and item.prompt_text:
+            display = item.prompt_text
+            if item.negative_prompt_text:
+                display += tr(
+                    f"\n[反向提示词] {item.negative_prompt_text}",
+                    f"\n[Negative] {item.negative_prompt_text}",
+                )
+            self.media_prompt_val_lbl.setText(display)
+            self.media_prompt_box.setVisible(True)
+        else:
+            self.media_prompt_val_lbl.setText("")
+            self.media_prompt_box.setVisible(False)
+
+    def _copy_selected_media_prompt(self) -> None:
+        item = self.vm.current_selected_media_item
+        if item and item.prompt_text:
+            self._copy_text(
+                item.prompt_text,
+                tr("已复制生成提示词到剪贴板。", "Copied generation prompt to clipboard."),
+            )
+
+    def _reuse_selected_media_prompt(self) -> None:
+        item = self.vm.current_selected_media_item
+        if not item or not item.prompt_text:
+            return
+        clean_p = item.prompt_text.split("\n[环境音效]")[0].strip()
+        self._syncing_ui = True
+        self.vm.visual_prompt = clean_p
+        self.vid_visual_edit.setPlainText(clean_p)
+        self.img_visual_edit.setPlainText(clean_p)
+        if item.negative_prompt_text:
+            self.vm.negative_prompt = item.negative_prompt_text
+            self.img_neg_edit.setPlainText(item.negative_prompt_text)
+        self._syncing_ui = False
+        self.vm.status_message = tr("已将成片提示词回填至输入框。", "Loaded media prompt into prompt editor.")
+        self.log_status_lbl.setText(self.vm.status_message)
 
     def _on_media_selected(self, path_obj: object, elapsed_obj: object, auto_play: bool) -> None:
         p = path_obj if isinstance(path_obj, Path) else None
         el = float(elapsed_obj) if isinstance(elapsed_obj, (int, float)) else None
         self.media_preview.load_media(p, elapsed_seconds=el, auto_play=auto_play)
+        if p is None and getattr(self.media_preview, "player", None) is not None:
+            try:
+                self.media_preview.player.setSource(QUrl())
+            except Exception:
+                pass
+        self._refresh_media_gallery()
 
     @staticmethod
     def _clear_layout(layout) -> None:

@@ -68,6 +68,7 @@ class StudioViewModel: ObservableObject {
                 remoteApiKeySynced = false
             }
             UserDefaults.standard.set(colabServerURL, forKey: "colabServerURL")
+            syncLocalGatewaySnapshot()
         }
     }
 
@@ -140,7 +141,9 @@ class StudioViewModel: ObservableObject {
     @Published var isWakingColab: Bool = false
 
     // 远端 GPU 与多模型驻留状态
-    @Published var isConnected: Bool = false
+    @Published var isConnected: Bool = false {
+        didSet { syncLocalGatewaySnapshot() }
+    }
     @Published var gpuName: String = L(StudioViewModel.defaultGpuNameZh, StudioViewModel.defaultGpuNameEn) {
         didSet { let c = stripEmoji(gpuName); if c != gpuName { gpuName = c } }
     }
@@ -163,8 +166,12 @@ class StudioViewModel: ObservableObject {
     @Published var ramHistoryPct: [Double] = []
     @Published var diskHistoryPct: [Double] = []
     @Published var combinedTelemetryChartMode: Bool = false
-    @Published var selectedModelId: String = "minimax_h3"
-    @Published var customModels: [OpenModelSpec] = []
+    @Published var selectedModelId: String = "minimax_h3" {
+        didSet { syncLocalGatewaySnapshot() }
+    }
+    @Published var customModels: [OpenModelSpec] = [] {
+        didSet { syncLocalGatewaySnapshot() }
+    }
     @Published var showAddCustomModelSheet: Bool = false
     @Published var customRepoInput: String = ""
     @Published var customIncludePatternInput: String = ""
@@ -179,7 +186,9 @@ class StudioViewModel: ObservableObject {
     @Published var isLoadingHFModelDetail: Bool = false
     @Published var showHFModelDetailOverlay: Bool = false
     @Published var loadedModelId: String? = nil
-    @Published var loadedModelIds: [String] = []
+    @Published var loadedModelIds: [String] = [] {
+        didSet { syncLocalGatewaySnapshot() }
+    }
     @Published var loadedModelsDetail: [LoadedModelSummary] = []
     @Published var modelLoaded: Bool = false
     @Published var isUnloadingModel: Bool = false
@@ -224,6 +233,8 @@ class StudioViewModel: ObservableObject {
     @Published var totalDiskSizeGB: Double = 0.0
     @Published var isDownloadingWeights: Bool = false
     @Published var isLoadingModel: Bool = false
+    @Published var isAutoLoadQueuedAfterDownload: Bool = false
+    var syncedCustomModelIdsByServer: [String: Set<String>] = [:]
 
     // ComfyUI 云端工作台与 Google Drive 软链持久化状态
     @Published var comfyRunning: Bool = false
@@ -287,9 +298,12 @@ class StudioViewModel: ObservableObject {
                 return
             }
             UserDefaults.standard.set(clamped, forKey: "qwenContextLengthK")
+            syncLocalGatewaySnapshot()
         }
     }
-    @Published var loadedContextLengthTokens: Int = 0
+    @Published var loadedContextLengthTokens: Int = 0 {
+        didSet { syncLocalGatewaySnapshot() }
+    }
     var remoteContextSynced: Bool = false
 
     var contextLengthTokens: Int {
@@ -335,10 +349,45 @@ class StudioViewModel: ObservableObject {
     }() {
         didSet {
             UserDefaults.standard.set(apiAccessKey, forKey: "apiAccessKey")
+            syncLocalGatewaySnapshot()
         }
     }
     @Published var apiRequestCount: Int = 0
     @Published var remoteApiKeySynced: Bool = false
+
+    // 本机固定端口反代网关（默认开启 127.0.0.1:8787，供 Magpie / Claude Code / 本地开发免改配置接入）
+    let localGateway = LocalAPIGatewayServer()
+    @Published var localProxyEnabled: Bool = {
+        if UserDefaults.standard.object(forKey: "localProxyEnabled") == nil { return true }
+        return UserDefaults.standard.bool(forKey: "localProxyEnabled")
+    }() {
+        didSet {
+            UserDefaults.standard.set(localProxyEnabled, forKey: "localProxyEnabled")
+            applyLocalProxyConfig()
+        }
+    }
+    @Published var localProxyPort: Int = {
+        let saved = UserDefaults.standard.integer(forKey: "localProxyPort")
+        return (1024...65535).contains(saved) ? saved : LocalAPIGatewayServer.defaultPort
+    }() {
+        didSet {
+            let clamped = max(1024, min(65535, localProxyPort))
+            if localProxyPort != clamped {
+                localProxyPort = clamped
+                return
+            }
+            UserDefaults.standard.set(clamped, forKey: "localProxyPort")
+        }
+    }
+    @Published var localProxyPortDraft: String = {
+        let saved = UserDefaults.standard.integer(forKey: "localProxyPort")
+        let port = (1024...65535).contains(saved) ? saved : LocalAPIGatewayServer.defaultPort
+        return String(port)
+    }()
+    @Published var localProxyRunning: Bool = false
+    @Published var localProxyBoundPort: Int = LocalAPIGatewayServer.defaultPort
+    @Published var localProxyError: String = ""
+    @Published var localProxyRequestCount: Int = 0
 
     // 任务进度与生成耗时状态
     @Published var isGenerating: Bool = false
@@ -350,6 +399,20 @@ class StudioViewModel: ObservableObject {
     ) ?? [:] {
         didSet {
             UserDefaults.standard.set(mediaElapsedMap, forKey: "mediaElapsedSecondsMap")
+        }
+    }
+    @Published var mediaPromptMap: [String: String] = (
+        UserDefaults.standard.dictionary(forKey: "mediaPromptTextMap") as? [String: String]
+    ) ?? [:] {
+        didSet {
+            UserDefaults.standard.set(mediaPromptMap, forKey: "mediaPromptTextMap")
+        }
+    }
+    @Published var mediaNegativePromptMap: [String: String] = (
+        UserDefaults.standard.dictionary(forKey: "mediaNegativePromptTextMap") as? [String: String]
+    ) ?? [:] {
+        didSet {
+            UserDefaults.standard.set(mediaNegativePromptMap, forKey: "mediaNegativePromptTextMap")
         }
     }
     @Published var statusMessage: String = L(StudioViewModel.defaultReadyStatusZh, StudioViewModel.defaultReadyStatusEn) {
@@ -367,11 +430,13 @@ class StudioViewModel: ObservableObject {
     @Published var currentPreviewImage: NSImage? = nil
     @Published var player: AVPlayer? = nil
     @Published var localMediaItems: [LocalMediaItem] = []
+    @Published var showClearHistoryConfirm: Bool = false
     @Published var showColabGuideSheet: Bool = false
     @Published var guideInitialStep: Int = 0
     @Published var showDisconnectConfirm: Bool = false
 
     var languageObserver: NSObjectProtocol? = nil
+    var appActiveObserver: NSObjectProtocol? = nil
 
     func toggleLanguage() {
         LanguageManager.shared.toggle()
@@ -527,6 +592,7 @@ class StudioViewModel: ObservableObject {
             || isGenerating
             || isLoadingModel
             || isDownloadingWeights
+            || isAutoLoadQueuedAfterDownload
             || vramTotalGB > 0
 
         stopLiveGenerationTimer()
@@ -538,7 +604,9 @@ class StudioViewModel: ObservableObject {
         isGenerating = false
         isLoadingModel = false
         isDownloadingWeights = false
+        isAutoLoadQueuedAfterDownload = false
         isUnloadingModel = false
+        syncedCustomModelIdsByServer.removeAll()
         comfyRunning = false
         comfyStarting = false
         comfySyncingDrive = false
@@ -639,11 +707,86 @@ class StudioViewModel: ObservableObject {
             || customModels.contains(where: { $0.modality == .llmVLM && loadedModelIds.contains($0.id) })
     }
 
+    var activeGatewayLLMModelSpec: OpenModelSpec {
+        let current = activeModelSpec
+        if current.modality == .llmVLM {
+            return current
+        }
+        if let loadedCustomOrBuiltin = allAvailableModels.first(where: {
+            $0.modality == .llmVLM && loadedModelIds.contains($0.id)
+        }) {
+            return loadedCustomOrBuiltin
+        }
+        return OPEN_MODEL_CATALOG.first(where: { $0.id == "qwen38_27b_gguf" }) ?? OPEN_MODEL_CATALOG[0]
+    }
+
+    func syncLocalGatewaySnapshot() {
+        let llmSpec = activeGatewayLLMModelSpec
+        let effContextTokens = loadedContextLengthTokens > 0 ? loadedContextLengthTokens : contextLengthTokens
+        let snap = LocalGatewaySnapshot(
+            upstreamBaseURL: normalizedBaseURL,
+            apiAccessKey: apiAccessKey.trimmingCharacters(in: .whitespacesAndNewlines),
+            isConnected: isConnected,
+            activeModelRepo: llmSpec.repoId,
+            activeModelName: llmSpec.name,
+            customRepoIds: customModels.map(\.repoId),
+            contextLengthTokens: effContextTokens
+        )
+        localGateway.updateSnapshot(snap)
+    }
+
+    func applyLocalProxyConfig() {
+        syncLocalGatewaySnapshot()
+        guard localProxyEnabled else {
+            localGateway.stop()
+            localProxyRunning = false
+            localProxyError = ""
+            return
+        }
+        switch localGateway.start(port: localProxyPort) {
+        case .success(let bound):
+            localProxyRunning = true
+            localProxyBoundPort = bound
+            localProxyError = ""
+        case .failure(let err):
+            localProxyRunning = false
+            localProxyError = err.localizedDescription
+        }
+    }
+
+    func updateLocalProxyPortFromDraft() {
+        let trimmed = localProxyPortDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsed = Int(trimmed), (1024...65535).contains(parsed) else {
+            localProxyPortDraft = String(localProxyPort)
+            statusMessage = L("本地网关端口需在 1024～65535 之间。", "Local gateway port must be between 1024 and 65535.")
+            return
+        }
+        localProxyPort = parsed
+        localProxyPortDraft = String(parsed)
+        if localProxyEnabled {
+            applyLocalProxyConfig()
+            if localProxyRunning {
+                statusMessage = L(
+                    "本机固定反代已监听 http://127.0.0.1:\(localProxyBoundPort)",
+                    "Local fixed reverse proxy listening on http://127.0.0.1:\(localProxyBoundPort)"
+                )
+            } else {
+                statusMessage = localProxyError
+            }
+        }
+    }
+
     let customModelsDefaultsKey = "easycolab.macos.custom_models.v1"
 
     init() {
         loadPersistedCustomModels()
         refreshLocalMedia()
+        localGateway.onRequestForwarded = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.localProxyRequestCount += 1
+            }
+        }
+        applyLocalProxyConfig()
         startBackgroundTelemetryLoop()
         languageObserver = NotificationCenter.default.addObserver(
             forName: .easyColabLanguageDidChange,
@@ -653,7 +796,17 @@ class StudioViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.syncLocalizedDynamicTexts()
+                self.syncLocalGatewaySnapshot()
                 self.objectWillChange.send()
+            }
+        }
+        appActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshLocalMedia()
             }
         }
         Task {
@@ -662,8 +815,12 @@ class StudioViewModel: ObservableObject {
     }
 
     deinit {
+        localGateway.stop()
         if let languageObserver {
             NotificationCenter.default.removeObserver(languageObserver)
+        }
+        if let appActiveObserver {
+            NotificationCenter.default.removeObserver(appActiveObserver)
         }
     }
 
@@ -672,6 +829,15 @@ class StudioViewModel: ObservableObject {
         selectedModelId = spec.id
         taskModeId = spec.modes[0].id
         inferenceSteps = spec.defaultSteps
+        if spec.id == "minimax_h3_image" {
+            if !MINIMAX_H3_IMAGE_RESOLUTIONS.contains(selectedImageResolution) {
+                selectedImageResolution = MINIMAX_H3_IMAGE_RESOLUTIONS[0]
+            }
+        } else if spec.modality == .image {
+            if !IMAGE_RESOLUTIONS.contains(selectedImageResolution) {
+                selectedImageResolution = IMAGE_RESOLUTIONS[0]
+            }
+        }
         selectedPrecision = "bf16"
         modelFiles = spec.defaultFiles
         downloadedCount = 0
@@ -712,16 +878,40 @@ class StudioViewModel: ObservableObject {
         }
     }
 
+    func serverModalityString(for mod: ModelModality) -> String {
+        switch mod {
+        case .video, .videoAudio:
+            return "video_audio"
+        case .image:
+            return "image"
+        case .llmVLM, .comfyUI:
+            return "llm_vlm"
+        }
+    }
+
     func notifyRemoteSelectModel(_ modelId: String) async {
         let base = normalizedBaseURL
         guard !base.isEmpty, let url = URL(string: "\(base)/minimax_api/select_model") else { return }
+        let spec = allAvailableModels.first(where: { $0.id == modelId }) ?? activeModelSpec
         do {
             var req = try adminRequest(url)
             req.httpMethod = "POST"
+            req.timeoutInterval = spec.isCustom ? 35 : 20
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try JSONSerialization.data(withJSONObject: ["model_id": modelId])
+            var payload: [String: Any] = ["model_id": modelId]
+            if spec.isCustom {
+                payload["repo_id"] = spec.repoId
+                payload["include_pattern"] = spec.includePattern
+                payload["custom_name"] = spec.nameZh
+                payload["modality"] = serverModalityString(for: spec.modality)
+                payload["hf_token"] = hfToken
+            }
+            req.httpBody = try JSONSerialization.data(withJSONObject: payload)
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
+            if spec.isCustom {
+                syncedCustomModelIdsByServer[base, default: []].insert(modelId)
+            }
             applyStatusResponse(decoded)
             if isSelectedModelLoadedInVRAM {
                 statusMessage = L(
@@ -735,11 +925,50 @@ class StudioViewModel: ObservableObject {
                 )
             } else {
                 statusMessage = L(
-                    "已切换至 \(activeModelSpec.name) | 权重进度 \(downloadedCount)/\(totalFileCount)，请先点击「下载权重」。",
-                    "Switched to \(activeModelSpec.name) | Weights \(downloadedCount)/\(totalFileCount). Click 'Download Weights' first."
+                    "已切换至 \(activeModelSpec.name) | 权重进度 \(downloadedCount)/\(totalFileCount)，点击「加载到显存」即可自动并发下载并装载。",
+                    "Switched to \(activeModelSpec.name) | Weights \(downloadedCount)/\(totalFileCount). Click 'Load to VRAM' to auto-download & load."
                 )
             }
         } catch {}
+    }
+
+    func syncBackgroundCustomModels(_ specs: [OpenModelSpec], base: String, keepSelectedModelId: String) async {
+        guard !specs.isEmpty, let registerURL = URL(string: "\(base)/minimax_api/custom_model/register") else { return }
+        var serverChangedSelection = false
+        for spec in specs {
+            guard isConnected, normalizedBaseURL == base else { return }
+            do {
+                var req = try adminRequest(registerURL)
+                req.httpMethod = "POST"
+                req.timeoutInterval = 35
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                let modStr = serverModalityString(for: spec.modality)
+                req.httpBody = try JSONSerialization.data(withJSONObject: [
+                    "model_id": spec.id,
+                    "repo_id": spec.repoId,
+                    "include_pattern": spec.includePattern,
+                    "custom_name": spec.nameZh,
+                    "modality": modStr,
+                    "modality_hint": modStr,
+                    "hf_token": hfToken,
+                    "auto_download": false,
+                    "preserve_selection": true
+                ])
+                let (data, resp) = try await adminSession.data(for: req)
+                if (resp as? HTTPURLResponse)?.statusCode == 200,
+                   let decoded = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
+                    if let remoteCustom = decoded.custom_models {
+                        mergeRemoteCustomModels(remoteCustom)
+                    }
+                    if let srvSel = decoded.selected_model_id, !srvSel.isEmpty, srvSel != keepSelectedModelId {
+                        serverChangedSelection = true
+                    }
+                }
+            } catch {}
+        }
+        if serverChangedSelection && isConnected && normalizedBaseURL == base && selectedModelId == keepSelectedModelId {
+            await notifyRemoteSelectModel(keepSelectedModelId)
+        }
     }
 
     let adminSession = URLSession(configuration: .ephemeral, delegate: SameOriginAdminRedirect(), delegateQueue: nil)
@@ -846,6 +1075,38 @@ class StudioViewModel: ObservableObject {
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
             applyStatusResponse(decoded)
 
+            let remoteCustomIds = Set((decoded.custom_models ?? []).map(\.id))
+            let alreadyAttempted = syncedCustomModelIdsByServer[base] ?? []
+            let missingCustomSpecs = customModels.filter {
+                !remoteCustomIds.contains($0.id) && !alreadyAttempted.contains($0.id)
+            }
+            let needsActiveCustomSelect = activeModelSpec.isCustom
+                && !alreadyAttempted.contains(selectedModelId)
+                && (!remoteCustomIds.contains(selectedModelId) || (decoded.selected_model_id != nil && decoded.selected_model_id != selectedModelId))
+
+            if !missingCustomSpecs.isEmpty || needsActiveCustomSelect {
+                var updatedAttempted = alreadyAttempted
+                for spec in missingCustomSpecs {
+                    updatedAttempted.insert(spec.id)
+                }
+                if needsActiveCustomSelect {
+                    updatedAttempted.insert(selectedModelId)
+                }
+                syncedCustomModelIdsByServer[base] = updatedAttempted
+
+                if needsActiveCustomSelect || missingCustomSpecs.contains(where: { $0.id == selectedModelId }) {
+                    await notifyRemoteSelectModel(selectedModelId)
+                }
+
+                let backgroundSpecs = missingCustomSpecs.filter { $0.id != selectedModelId }
+                if !backgroundSpecs.isEmpty {
+                    let keepSelectedId = selectedModelId
+                    Task {
+                        await syncBackgroundCustomModels(backgroundSpecs, base: base, keepSelectedModelId: keepSelectedId)
+                    }
+                }
+            }
+
             if !silent {
                 if isSelectedModelLoadedInVRAM {
                     statusMessage = L(
@@ -859,8 +1120,8 @@ class StudioViewModel: ObservableObject {
                     )
                 } else {
                     statusMessage = L(
-                        "已连接 \(gpuName) | \(activeModelSpec.name) 权重进度 \(downloadedCount)/\(totalFileCount)，请先点击「下载权重」。",
-                        "Connected to \(gpuName) | \(activeModelSpec.name) weights \(downloadedCount)/\(totalFileCount). Click 'Download Weights' first."
+                        "已连接 \(gpuName) | \(activeModelSpec.name) 权重进度 \(downloadedCount)/\(totalFileCount)，点击「加载到显存」即可自动并发下载并装载。",
+                        "Connected to \(gpuName) | \(activeModelSpec.name) weights \(downloadedCount)/\(totalFileCount). Click 'Load to VRAM' to auto-download & load."
                     )
                 }
             }
@@ -898,55 +1159,85 @@ class StudioViewModel: ObservableObject {
         } catch {}
     }
 
-    func startRemoteDownloadWeights() async {
+    @discardableResult
+    func startRemoteDownloadWeights(silentCompletionStatus: Bool = false) async -> Bool {
         let base = normalizedBaseURL
         guard !base.isEmpty, let url = URL(string: "\(base)/minimax_api/download_model") else {
             statusMessage = L("请先连接有效的 Colab 服务端地址。", "Please connect to a valid Colab Server URL first.")
-            return
+            return false
         }
 
-        let targetModel = selectedModelId
+        let targetSpec = activeModelSpec
+        let targetModel = targetSpec.id
         isDownloadingWeights = true
         modelTaskProgress = 0.05
-        statusMessage = L(
-            "已通知 Colab 启动 8 线程并发下载 \(activeModelSpec.name)...",
-            "Started 8-thread parallel weight download on Colab for \(activeModelSpec.name)..."
-        )
+        if !silentCompletionStatus {
+            statusMessage = L(
+                "已通知 Colab 启动 8 线程并发下载 \(targetSpec.name)...",
+                "Started 8-thread parallel weight download on Colab for \(targetSpec.name)..."
+            )
+        }
 
         do {
             var req = try adminRequest(url)
             req.httpMethod = "POST"
+            req.timeoutInterval = targetSpec.isCustom ? 35 : 22
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try JSONSerialization.data(withJSONObject: [
                 "model_id": targetModel,
                 "hf_token": hfToken,
-                "repo_id": activeModelSpec.isCustom ? activeModelSpec.repoId : "",
-                "include_pattern": activeModelSpec.isCustom ? activeModelSpec.includePattern : "",
-                "custom_name": activeModelSpec.isCustom ? activeModelSpec.nameZh : ""
+                "repo_id": targetSpec.isCustom ? targetSpec.repoId : "",
+                "include_pattern": targetSpec.isCustom ? targetSpec.includePattern : "",
+                "custom_name": targetSpec.isCustom ? targetSpec.nameZh : "",
+                "modality": targetSpec.isCustom ? serverModalityString(for: targetSpec.modality) : "auto"
             ])
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
             applyStatusResponse(decoded)
+            if !allDownloaded {
+                isDownloadingWeights = true
+            }
 
+            var pollFailures = 0
             while isDownloadingWeights {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
+                guard isConnected else {
+                    isDownloadingWeights = false
+                    break
+                }
                 if let statusURL = URL(string: "\(base)/minimax_api/status?model_id=\(targetModel)"),
-                   let (sData, _) = try? await adminSession.data(for: adminRequest(statusURL)),
+                   let statusReq = try? adminRequest(statusURL),
+                   let (sData, sResp) = try? await adminSession.data(for: statusReq),
+                   (sResp as? HTTPURLResponse)?.statusCode == 200,
                    let sDecoded = try? JSONDecoder().decode(ColabStatusResponse.self, from: sData) {
+                    pollFailures = 0
                     applyStatusResponse(sDecoded)
-                    if let msg = sDecoded.task_message, !msg.isEmpty { statusMessage = msg }
+                    if let msg = sDecoded.task_message, !msg.isEmpty {
+                        let finishedOK = !(sDecoded.is_downloading ?? false) && allDownloaded
+                        if !(silentCompletionStatus && finishedOK) {
+                            statusMessage = msg
+                        }
+                    }
                     if !(sDecoded.is_downloading ?? false) {
+                        isDownloadingWeights = false
+                        break
+                    }
+                } else {
+                    pollFailures += 1
+                    if pollFailures >= 8 {
                         isDownloadingWeights = false
                         break
                     }
                 }
             }
+            return allDownloaded
         } catch {
             isDownloadingWeights = false
             statusMessage = L(
                 "下载权重请求失败: \(error.localizedDescription)",
                 "Weight download request failed: \(error.localizedDescription)"
             )
+            return false
         }
     }
 
@@ -957,32 +1248,55 @@ class StudioViewModel: ObservableObject {
             return
         }
 
+        let targetSpec = activeModelSpec
+        let targetModel = targetSpec.id
+
         if !allDownloaded {
+            isAutoLoadQueuedAfterDownload = true
+            defer { isAutoLoadQueuedAfterDownload = false }
             statusMessage = L(
-                "\(activeModelSpec.name) 权重尚未下载完整 (\(downloadedCount)/\(totalFileCount))，请先点击「下载权重」。",
-                "\(activeModelSpec.name) weights are incomplete (\(downloadedCount)/\(totalFileCount)). Click 'Download Weights' first."
+                "检测到当前实例尚未缓存 \(targetSpec.name) 权重，正在自动并发下载并在完成后装载进显存...",
+                "Weights for \(targetSpec.name) are not cached on this instance — auto-downloading and then loading into VRAM..."
             )
-            return
+            let dlOK = await startRemoteDownloadWeights(silentCompletionStatus: true)
+            isAutoLoadQueuedAfterDownload = false
+            guard dlOK && allDownloaded && isConnected && selectedModelId == targetModel else {
+                if !isConnected {
+                    statusMessage = L(
+                        "下载或装载中断：与 Colab 实例的连接已断开。",
+                        "Download/load interrupted: disconnected from Colab instance."
+                    )
+                } else if selectedModelId == targetModel && !allDownloaded {
+                    let low = statusMessage.lowercased()
+                    if !statusMessage.contains("出错") && !statusMessage.contains("失败") && !low.contains("fail") && !low.contains("error") {
+                        statusMessage = L(
+                            "\(targetSpec.name) 权重下载未完成 (\(downloadedCount)/\(totalFileCount))，未能继续装载进显存。",
+                            "\(targetSpec.name) weights incomplete (\(downloadedCount)/\(totalFileCount)); aborted loading into VRAM."
+                        )
+                    }
+                }
+                return
+            }
         }
 
-        let targetModel = selectedModelId
         isLoadingModel = true
         modelTaskProgress = 0.15
-        if activeModelSpec.modality == .llmVLM {
+        if targetSpec.modality == .llmVLM {
             statusMessage = L(
-                "正在将 \(activeModelSpec.name) 装载进 Colab GPU 显存 (上下文 \(contextLengthK)K)...",
-                "Loading \(activeModelSpec.name) into Colab GPU VRAM (Context \(contextLengthK)K)..."
+                "正在将 \(targetSpec.name) 装载进 Colab GPU 显存 (上下文 \(contextLengthK)K)...",
+                "Loading \(targetSpec.name) into Colab GPU VRAM (Context \(contextLengthK)K)..."
             )
         } else {
             statusMessage = L(
-                "正在将 \(activeModelSpec.name) 装载进 Colab GPU 显存...",
-                "Loading \(activeModelSpec.name) into Colab GPU VRAM..."
+                "正在将 \(targetSpec.name) 装载进 Colab GPU 显存...",
+                "Loading \(targetSpec.name) into Colab GPU VRAM..."
             )
         }
 
         do {
             var req = try adminRequest(url)
             req.httpMethod = "POST"
+            req.timeoutInterval = targetSpec.isCustom ? 35 : 22
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let body: [String: Any] = [
                 "model_id": targetModel,
@@ -990,24 +1304,44 @@ class StudioViewModel: ObservableObject {
                 "offload_mode": selectedOffload,
                 "context_length": contextLengthTokens,
                 "hf_token": hfToken,
-                "repo_id": activeModelSpec.isCustom ? activeModelSpec.repoId : "",
-                "include_pattern": activeModelSpec.isCustom ? activeModelSpec.includePattern : "",
-                "custom_name": activeModelSpec.isCustom ? activeModelSpec.nameZh : ""
+                "repo_id": targetSpec.isCustom ? targetSpec.repoId : "",
+                "include_pattern": targetSpec.isCustom ? targetSpec.includePattern : "",
+                "custom_name": targetSpec.isCustom ? targetSpec.nameZh : "",
+                "modality": targetSpec.isCustom ? serverModalityString(for: targetSpec.modality) : "auto"
             ]
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
             applyStatusResponse(decoded)
+            if !isSelectedModelLoadedInVRAM {
+                isLoadingModel = true
+            }
 
+            var pollFailures = 0
             while isLoadingModel {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
+                guard isConnected else {
+                    isLoadingModel = false
+                    break
+                }
                 if let statusURL = URL(string: "\(base)/minimax_api/status?model_id=\(targetModel)"),
-                   let (sData, _) = try? await adminSession.data(for: adminRequest(statusURL)),
+                   let statusReq = try? adminRequest(statusURL),
+                   let (sData, sResp) = try? await adminSession.data(for: statusReq),
+                   (sResp as? HTTPURLResponse)?.statusCode == 200,
                    let sDecoded = try? JSONDecoder().decode(ColabStatusResponse.self, from: sData) {
+                    pollFailures = 0
                     applyStatusResponse(sDecoded)
                     if let msg = sDecoded.task_message, !msg.isEmpty { statusMessage = msg }
-                    if !(sDecoded.is_loading_vram ?? false) {
+                    if !(sDecoded.is_loading_vram ?? false) && !(sDecoded.is_downloading ?? false) {
+                        isLoadingModel = false
+                        break
+                    } else {
+                        isLoadingModel = true
+                    }
+                } else {
+                    pollFailures += 1
+                    if pollFailures >= 8 {
                         isLoadingModel = false
                         break
                     }
@@ -1279,7 +1613,14 @@ class StudioViewModel: ObservableObject {
                 return
             }
 
-            await pollColabJob(baseURL: base, jobId: job.job_id, assistantRowIndex: assistantRowIndex, token: myToken)
+            await pollColabJob(
+                baseURL: base,
+                jobId: job.job_id,
+                assistantRowIndex: assistantRowIndex,
+                token: myToken,
+                submittedPrompt: promptTrimmed,
+                submittedNegativePrompt: negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
 
         } catch {
             guard activeGenerationToken == myToken else { return }
@@ -1293,7 +1634,14 @@ class StudioViewModel: ObservableObject {
         }
     }
 
-    func pollColabJob(baseURL: String, jobId: String, assistantRowIndex: Int?, token: UUID) async {
+    func pollColabJob(
+        baseURL: String,
+        jobId: String,
+        assistantRowIndex: Int?,
+        token: UUID,
+        submittedPrompt: String = "",
+        submittedNegativePrompt: String = ""
+    ) async {
         guard let pollURL = URL(string: "\(baseURL)/minimax_api/job/\(jobId)") else {
             if activeGenerationToken == token {
                 stopLiveGenerationTimer()
@@ -1388,7 +1736,9 @@ class StudioViewModel: ObservableObject {
                                 from: downloadURL,
                                 filename: item.filename,
                                 elapsedSeconds: item.elapsed ?? job.elapsed,
-                                keepGeneratingProgress: job.status != "completed"
+                                keepGeneratingProgress: job.status != "completed",
+                                promptUsed: submittedPrompt,
+                                negativePromptUsed: submittedNegativePrompt
                             )
                         }
                     }
@@ -1415,7 +1765,9 @@ class StudioViewModel: ObservableObject {
                         await downloadMediaToLocal(
                             from: downloadURL,
                             filename: fname,
-                            elapsedSeconds: finalElapsed
+                            elapsedSeconds: finalElapsed,
+                            promptUsed: submittedPrompt,
+                            negativePromptUsed: submittedNegativePrompt
                         )
                     }
                     guard activeGenerationToken == token else { break }
@@ -1463,7 +1815,9 @@ class StudioViewModel: ObservableObject {
         from remoteURL: URL,
         filename: String,
         elapsedSeconds: Double? = nil,
-        keepGeneratingProgress: Bool = false
+        keepGeneratingProgress: Bool = false,
+        promptUsed: String = "",
+        negativePromptUsed: String = ""
     ) async {
         do {
             let (tempURL, response) = try await adminSession.download(for: adminRequest(remoteURL))
@@ -1473,8 +1827,15 @@ class StudioViewModel: ObservableObject {
                 try FileManager.default.removeItem(at: destURL)
             }
             try FileManager.default.moveItem(at: tempURL, to: destURL)
+            let savedName = destURL.lastPathComponent
             if let el = elapsedSeconds, el > 0 {
-                mediaElapsedMap[destURL.lastPathComponent] = el
+                mediaElapsedMap[savedName] = el
+            }
+            if !promptUsed.isEmpty {
+                mediaPromptMap[savedName] = promptUsed
+            }
+            if !negativePromptUsed.isEmpty {
+                mediaNegativePromptMap[savedName] = negativePromptUsed
             }
             refreshLocalMedia()
             selectMedia(destURL)
