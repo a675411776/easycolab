@@ -334,6 +334,9 @@ class ViewModelServicesMixin:
         threading.Thread(target=worker, daemon=True).start()
 
     def logout_google_account(self) -> None:
+        self.stop_active_wake_process()
+        self.stop_keepalive_daemon()
+
         def worker() -> None:
             try:
                 self._run_bridge_json(["auth_logout"], install_if_missing=False, timeout=20)
@@ -355,8 +358,248 @@ class ViewModelServicesMixin:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def wake_colab_headless(self) -> None:
+    def stop_active_wake_process(self) -> None:
+        with self._wake_lock:
+            self._wake_run_token += 1
+            proc = self._active_wake_proc
+            self._active_wake_proc = None
+        self._wake_obtained_url_this_run = False
         if self.is_waking_colab:
+            self.is_waking_colab = False
+            self.sync_windows_runtime_activity_assertion()
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _is_keepalive_daemon_alive(self) -> bool:
+        proc = self._keepalive_daemon_proc
+        return proc is not None and proc.poll() is None
+
+    def _can_run_keepalive_daemon(self) -> bool:
+        return (
+            not self._is_closing
+            and self.cli_logged_in
+            and self.is_connected
+            and not self.is_waking_colab
+            and not self.is_releasing_colab
+        )
+
+    @staticmethod
+    def _terminate_daemon_proc(proc: subprocess.Popen) -> None:
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=1.5)
+            except Exception:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+    def stop_keepalive_daemon(self) -> None:
+        with self._keepalive_lock:
+            self._keepalive_epoch += 1
+            self._is_starting_keepalive_daemon = False
+            proc = self._keepalive_daemon_proc
+            self._keepalive_daemon_proc = None
+        if proc is not None:
+            self._terminate_daemon_proc(proc)
+        self.keepalive_proxy_ws_connected = False
+
+    def _handle_keepalive_daemon_payload_line(
+        self, json_line: str, daemon_epoch: Optional[int] = None
+    ) -> None:
+        if daemon_epoch is not None and daemon_epoch != self._keepalive_epoch:
+            return
+        if self.is_releasing_colab or self._is_closing:
+            return
+        try:
+            data = json.loads(json_line)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        if data.get("logged_in") is not None:
+            self.cli_logged_in = bool(data["logged_in"])
+        if data.get("ws_connected") is not None:
+            self.keepalive_proxy_ws_connected = bool(data["ws_connected"])
+        if data.get("paid_balance") is not None:
+            bal = float(data["paid_balance"])
+            self.official_cu_balance = bal
+            self.total_budget_cu = bal
+        if data.get("burn_rate_hourly") is not None:
+            self.official_burn_rate = float(data["burn_rate_hourly"])
+        if data.get("active_assignments") is not None:
+            self.active_vm_count = int(data["active_assignments"])
+        self.state_changed.emit()
+
+    def ensure_keepalive_daemon_running(self) -> None:
+        if not self._can_run_keepalive_daemon():
+            return
+        if self._is_keepalive_daemon_alive():
+            return
+        with self._keepalive_lock:
+            if (
+                not self._can_run_keepalive_daemon()
+                or self._is_starting_keepalive_daemon
+                or self._is_keepalive_daemon_alive()
+            ):
+                return
+            self._is_starting_keepalive_daemon = True
+            my_epoch = self._keepalive_epoch
+
+        def daemon_worker() -> None:
+            proc: Optional[subprocess.Popen] = None
+            try:
+                cmd = self._resolve_python_for_bridge(install_if_missing=False) + ["keepalive_daemon"]
+                with self._keepalive_lock:
+                    if (
+                        self._keepalive_epoch != my_epoch
+                        or not self._can_run_keepalive_daemon()
+                        or self._is_keepalive_daemon_alive()
+                    ):
+                        return
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    env=self._bridge_env(),
+                    creationflags=WIN_NO_WINDOW,
+                )
+                abort_proc = False
+                with self._keepalive_lock:
+                    if (
+                        self._keepalive_epoch != my_epoch
+                        or not self._can_run_keepalive_daemon()
+                        or self._is_keepalive_daemon_alive()
+                    ):
+                        abort_proc = True
+                    else:
+                        self._keepalive_daemon_proc = proc
+                        self._is_starting_keepalive_daemon = False
+                if abort_proc:
+                    self._terminate_daemon_proc(proc)
+                    proc = None
+                    return
+
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    if self._keepalive_epoch != my_epoch:
+                        break
+                    line = raw_line.strip()
+                    if not line or "KEEPALIVE_JSON:" not in line:
+                        continue
+                    payload = line.split("KEEPALIVE_JSON:", 1)[1].strip()
+                    if payload:
+                        self._dispatch_ui(
+                            lambda p=payload, ep=my_epoch: self._handle_keepalive_daemon_payload_line(
+                                p, ep
+                            )
+                        )
+            except Exception:
+                pass
+            finally:
+                with self._keepalive_lock:
+                    if self._keepalive_epoch == my_epoch:
+                        self._is_starting_keepalive_daemon = False
+                if proc is not None:
+                    if proc.stdin is not None:
+                        try:
+                            proc.stdin.close()
+                        except Exception:
+                            pass
+                    if proc.stdout is not None:
+                        try:
+                            proc.stdout.close()
+                        except Exception:
+                            pass
+
+                    def on_daemon_exit(exited_proc: subprocess.Popen = proc) -> None:
+                        with self._keepalive_lock:
+                            is_current = self._keepalive_daemon_proc is exited_proc
+                            if is_current:
+                                self._keepalive_daemon_proc = None
+                        if is_current:
+                            self.keepalive_proxy_ws_connected = False
+                            self.state_changed.emit()
+
+                    self._dispatch_ui(on_daemon_exit)
+
+        threading.Thread(target=daemon_worker, daemon=True).start()
+
+    def _handle_wake_output_line(
+        self, line: str, gpu: str, password: str, wake_token: Optional[int] = None
+    ) -> None:
+        if wake_token is not None and wake_token != self._wake_run_token:
+            return
+        if self._is_closing or self.is_releasing_colab:
+            return
+        if line.startswith("WAKE_URL:"):
+            url = line[len("WAKE_URL:") :].strip()
+            self.set_colab_server_url(url)
+            self.set_admin_password(password)
+            self._wake_obtained_url_this_run = True
+            self.append_console_line(
+                tr(
+                    f"成功获取云端隧道地址: {self.masked_url(url)}",
+                    f"Tunnel URL acquired: {self.masked_url(url)}",
+                )
+            )
+            self.status_message = tr(
+                f"云端 {gpu} 实例已唤醒就绪，正在同步模型状态...",
+                f"Cloud {gpu} runtime is online! Syncing model status...",
+            )
+            self.state_changed.emit()
+        elif line.startswith("WAKE_ERROR:"):
+            err_txt = strip_emoji(line[len("WAKE_ERROR:") :].strip()) or line
+            loc_e = localize_server_text(err_txt)
+            msg_e = tr(f"唤醒失败: {loc_e}", f"Wake failed: {loc_e}")
+            self.append_console_line(msg_e)
+            self.status_message = msg_e
+            self.state_changed.emit()
+        elif line.startswith("WAKE_LOG:"):
+            clean = strip_emoji(line[len("WAKE_LOG:") :].strip())
+            if clean:
+                loc_c = localize_server_text(clean)
+                self.append_console_line(loc_c)
+                self.status_message = loc_c
+                self.state_changed.emit()
+        elif (
+            not line.startswith("[colab]")
+            and "Assignment request failed" not in line
+            and "urllib3" not in line
+        ):
+            clean = strip_emoji(line.strip())
+            if clean:
+                self.append_console_line(localize_server_text(clean))
+                self.state_changed.emit()
+
+    def wake_colab_headless(self) -> None:
+        if self.is_waking_colab or self.is_releasing_colab or self._is_closing:
             return
         if not self.cli_logged_in:
             self.status_message = tr(
@@ -372,9 +615,18 @@ class ViewModelServicesMixin:
             self.state_changed.emit()
             return
 
+        self.stop_active_wake_process()
+        self.stop_keepalive_daemon()
+        with self._wake_lock:
+            self._wake_run_token += 1
+            my_token = self._wake_run_token
+        self._wake_obtained_url_this_run = False
+
         password = secrets.token_urlsafe(32)
         gpu = self.wake_gpu_choice
+        idle_min = self.idle_timeout_minutes
         self.is_waking_colab = True
+        self.sync_windows_runtime_activity_assertion()
         self.status_message = tr(
             f"正在唤醒 Google Colab {gpu} 实例并自动部署多模型服务端...",
             f"Waking Google Colab {gpu} runtime & deploying multi-model server...",
@@ -388,6 +640,7 @@ class ViewModelServicesMixin:
         self.state_changed.emit()
 
         def worker() -> None:
+            proc: Optional[subprocess.Popen] = None
             try:
                 cmd = self._resolve_python_for_bridge(install_if_missing=True) + [
                     "wake",
@@ -396,6 +649,9 @@ class ViewModelServicesMixin:
                     "--app-py",
                     str(app_py),
                 ]
+                with self._wake_lock:
+                    if self._wake_run_token != my_token or self._is_closing or self.is_releasing_colab:
+                        return
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -404,74 +660,87 @@ class ViewModelServicesMixin:
                     encoding="utf-8",
                     errors="replace",
                     bufsize=1,
-                    env={**self._bridge_env(), "EASYCOLAB_ADMIN_PASSWORD": password},
+                    env={
+                        **self._bridge_env(),
+                        "EASYCOLAB_ADMIN_PASSWORD": password,
+                        "EASYCOLAB_IDLE_TIMEOUT_MINUTES": str(idle_min),
+                    },
                     creationflags=WIN_NO_WINDOW,
                 )
+                abort_wake = False
+                with self._wake_lock:
+                    if self._wake_run_token != my_token or self._is_closing or self.is_releasing_colab:
+                        abort_wake = True
+                    else:
+                        self._active_wake_proc = proc
+                if abort_wake:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    return
                 assert proc.stdout is not None
                 for raw_line in proc.stdout:
+                    if self._wake_run_token != my_token:
+                        break
                     line = raw_line.strip()
                     if not line:
                         continue
-                    if line.startswith("WAKE_URL:"):
-                        url = line[len("WAKE_URL:") :].strip()
-
-                        def on_url(u: str = url) -> None:
-                            self.set_colab_server_url(u)
-                            self.set_admin_password(password)
-                            self.append_console_line(
-                                tr(
-                                    f"成功获取云端隧道地址: {self.masked_url(u)}",
-                                    f"Tunnel URL acquired: {self.masked_url(u)}",
-                                )
-                            )
-                            self.status_message = tr(
-                                f"云端 {gpu} 实例已唤醒就绪，正在同步模型状态...",
-                                f"Cloud {gpu} runtime is online! Syncing model status...",
-                            )
-                            self.state_changed.emit()
-
-                        self._dispatch_ui(on_url)
-                    elif line.startswith("WAKE_ERROR:"):
-                        err_txt = strip_emoji(line[len("WAKE_ERROR:") :].strip())
-
-                        def on_err(e: str = err_txt) -> None:
-                            loc_e = localize_server_text(e)
-                            msg_e = tr(f"唤醒失败: {loc_e}", f"Wake failed: {loc_e}")
-                            self.append_console_line(msg_e)
-                            self.status_message = msg_e
-                            self.state_changed.emit()
-
-                        self._dispatch_ui(on_err)
-                    else:
-                        clean = strip_emoji(line.replace("WAKE_LOG:", "").strip())
-                        if clean:
-
-                            def on_log(c: str = clean) -> None:
-                                loc_c = localize_server_text(c)
-                                self.append_console_line(loc_c)
-                                self.status_message = loc_c
-                                self.state_changed.emit()
-
-                            self._dispatch_ui(on_log)
+                    self._dispatch_ui(
+                        lambda ln=line, tok=my_token: self._handle_wake_output_line(
+                            ln, gpu, password, tok
+                        )
+                    )
                 proc.wait(timeout=30)
             except Exception as exc:
                 err_msg = str(exc)
-                self._dispatch_ui(
-                    lambda: self._set_status_and_log(tr(f"唤醒进程异常: {err_msg}", f"Wake process error: {err_msg}"))
-                )
+
+                def on_wake_exc(msg: str = err_msg, tok: int = my_token) -> None:
+                    if self._wake_run_token != tok or self._is_closing or self.is_releasing_colab:
+                        return
+                    self._set_status_and_log(tr(f"唤醒进程异常: {msg}", f"Wake process error: {msg}"))
+
+                self._dispatch_ui(on_wake_exc)
 
             def finish_ui() -> None:
+                with self._wake_lock:
+                    if self._wake_run_token != my_token:
+                        return
+                    if proc is not None and self._active_wake_proc is proc:
+                        self._active_wake_proc = None
+                if self._is_closing or self.is_releasing_colab:
+                    self.is_waking_colab = False
+                    self.sync_windows_runtime_activity_assertion()
+                    return
                 self.is_waking_colab = False
+                self.sync_windows_runtime_activity_assertion()
                 self.state_changed.emit()
                 self.refresh_official_colab_account_usage()
-                if self.normalized_base_url:
+                if self._wake_obtained_url_this_run and self.normalized_base_url:
                     self.check_colab_status(silent=False)
+                    self.ensure_keepalive_daemon_running()
 
             self._dispatch_ui(finish_ui)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def keepalive_colab_runtime(self) -> None:
+        if (
+            not self.cli_logged_in
+            or self.is_waking_colab
+            or self.is_releasing_colab
+            or self._is_closing
+        ):
+            return
+        if self.is_connected:
+            self.ensure_keepalive_daemon_running()
+            if self._is_keepalive_daemon_alive() or self._is_starting_keepalive_daemon:
+                return
+
         def worker() -> None:
             try:
                 data = self._run_bridge_json(["keepalive"], install_if_missing=False, timeout=35)
@@ -479,6 +748,8 @@ class ViewModelServicesMixin:
                 return
 
             def apply_ui() -> None:
+                if self.is_releasing_colab or self._is_closing:
+                    return
                 if data.get("paid_balance") is not None:
                     bal = float(data["paid_balance"])
                     self.official_cu_balance = bal
@@ -497,8 +768,11 @@ class ViewModelServicesMixin:
         if self.is_releasing_colab:
             return
         self.is_releasing_colab = True
+        self.stop_active_wake_process()
+        self.stop_keepalive_daemon()
         self._active_generation_token = str(uuid.uuid4())
         self.is_generating = False
+        self.sync_windows_runtime_activity_assertion()
         self.status_message = tr(
             "正在同步云盘数据并彻底销毁所有运行中的 Colab GPU 实例...",
             "Syncing Google Drive & terminating all active Colab GPU runtimes...",
@@ -1137,10 +1411,10 @@ class ViewModelServicesMixin:
         model_id = f"custom_{slug[:40]}"
         if mod_pref == "auto":
             lower = f"{clean_repo} {inc}".lower()
-            if any(k in lower for k in ("video", "wan", "ltx", "minimax", "hunyuan")):
-                resolved_mod = "video_audio"
-            elif any(k in lower for k in ("flux", "image", "sdxl", "z-image")):
+            if any(k in lower for k in ("flux", "image", "sdxl", "z-image")):
                 resolved_mod = "image"
+            elif any(k in lower for k in ("video", "wan", "ltx", "minimax", "hunyuan")):
+                resolved_mod = "video_audio"
             else:
                 resolved_mod = "llm_vlm"
         else:
@@ -1220,6 +1494,8 @@ class ViewModelServicesMixin:
     def update_idle_timeout_config(self, minutes: int) -> None:
         self.idle_timeout_minutes = minutes
         self._save_setting("idleTimeoutMinutes", minutes)
+        self._remote_idle_synced = False
+        self._last_idle_sync_attempt_ts = time.time()
         self.state_changed.emit()
 
         base = self.normalized_base_url
@@ -1235,7 +1511,13 @@ class ViewModelServicesMixin:
                 )
                 if r.status_code == 200:
                     data = r.json()
-                    self._dispatch_ui(lambda: self._apply_status_response(data, update_status_msg=False))
+
+                    def on_ok() -> None:
+                        self._apply_status_response(data, update_status_msg=False)
+                        if data.get("idle_timeout_minutes") == minutes:
+                            self._remote_idle_synced = True
+
+                    self._dispatch_ui(on_ok)
             except Exception:
                 pass
 

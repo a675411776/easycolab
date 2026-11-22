@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 
-def _read_version(default: str = "1.2.0") -> str:
+def _read_version(default: str = "1.2.1") -> str:
     candidates = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:

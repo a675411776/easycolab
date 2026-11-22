@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QTimer, QUrl, Qt
+from PySide6.QtCore import QEvent, QTimer, QUrl, Qt
 from PySide6.QtGui import QAction, QFontMetrics, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -171,6 +171,42 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         # First-run onboarding guide after 350ms
         if not self.vm.has_seen_onboarding:
             QTimer.singleShot(350, lambda: self.open_onboarding_guide(0))
+
+        app_inst = QApplication.instance()
+        if app_inst is not None:
+            app_inst.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        try:
+            et = event.type()
+            if et in (
+                QEvent.Type.KeyPress,
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.Wheel,
+            ):
+                self.vm.record_local_interaction()
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
+
+    def closeEvent(self, event) -> None:
+        self.vm._is_closing = True
+        app_inst = QApplication.instance()
+        if app_inst is not None:
+            try:
+                app_inst.removeEventFilter(self)
+            except Exception:
+                pass
+        try:
+            if hasattr(self, "media_preview") and self.media_preview is not None:
+                self.media_preview.stop_video()
+        except Exception:
+            pass
+        self.vm.stop_active_wake_process()
+        self.vm.stop_keepalive_daemon()
+        self.vm.stop_local_gateway()
+        self.vm.sync_windows_runtime_activity_assertion(force_clear=True)
+        super().closeEvent(event)
 
     @property
     def palette_obj(self) -> StudioPalette:

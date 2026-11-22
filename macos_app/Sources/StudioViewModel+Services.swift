@@ -6,6 +6,49 @@ import ObjectiveC.runtime
 
 // MARK: - StudioViewModel 扩展：Google OAuth 桥接、自定义 HF 模型热榜与详情、ComfyUI 与网关同步
 
+final class KeepalivePipeLineBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = Data()
+
+    func appendAndExtractLines(_ chunk: Data) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        pending.append(chunk)
+        var lines: [String] = []
+        while let nlIdx = pending.firstIndex(of: 0x0A) {
+            let lineData = pending.subdata(in: 0..<nlIdx)
+            pending.removeSubrange(0...nlIdx)
+            if let lineStr = String(data: lineData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !lineStr.isEmpty {
+                lines.append(lineStr)
+            }
+        }
+        return lines
+    }
+
+    func flushRemainingLine() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !pending.isEmpty else { return nil }
+        let rem = pending
+        pending.removeAll()
+        if let lineStr = String(data: rem, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !lineStr.isEmpty {
+            return lineStr
+        }
+        return nil
+    }
+
+    func appendAndExtractPayloads(_ chunk: Data) -> [String] {
+        appendAndExtractLines(chunk).compactMap { lineStr in
+            guard lineStr.hasPrefix("KEEPALIVE_JSON:") else { return nil }
+            return String(lineStr.dropFirst("KEEPALIVE_JSON:".count))
+        }
+    }
+}
+
 extension StudioViewModel {
     // MARK: - 本地 colab_bridge.py 交互与零配置环境自举
     func ensureBridgePythonBin(installIfMissing: Bool) async -> String? {
@@ -98,6 +141,19 @@ extension StudioViewModel {
         }
     }
 
+    nonisolated static func extractJSONPayload(from rawOutput: String) -> String {
+        let trimmed = rawOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let lines = trimmed.components(separatedBy: .newlines)
+        for line in lines.reversed() {
+            let candidate = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if candidate.hasPrefix("{") && candidate.hasSuffix("}") {
+                return candidate
+            }
+        }
+        return trimmed
+    }
+
     func runBridgeCommand(_ args: [String], installIfMissing: Bool = false) async -> String {
         guard let pyBin = await ensureBridgePythonBin(installIfMissing: installIfMissing) else {
             return ""
@@ -108,15 +164,15 @@ extension StudioViewModel {
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: pyBin)
                 proc.arguments = [script] + args
-                let pipe = Pipe()
-                proc.standardOutput = pipe
-                proc.standardError = pipe
+                let outPipe = Pipe()
+                proc.standardOutput = outPipe
+                proc.standardError = FileHandle.nullDevice
                 do {
                     try proc.run()
+                    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
                     proc.waitUntilExit()
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
                     let out = String(data: data, encoding: .utf8) ?? ""
-                    continuation.resume(returning: out.trimmingCharacters(in: .whitespacesAndNewlines))
+                    continuation.resume(returning: Self.extractJSONPayload(from: out))
                 } catch {
                     continuation.resume(returning: "")
                 }
@@ -172,6 +228,8 @@ extension StudioViewModel {
     }
 
     func logoutGoogleAccount() async {
+        stopActiveWakeProcess()
+        stopKeepaliveDaemon()
         _ = await runBridgeCommand(["auth_logout"], installIfMissing: false)
         cliLoggedIn = false
         accountEmail = ""
@@ -228,11 +286,51 @@ extension StudioViewModel {
         }
     }
 
+    func stopActiveWakeProcess() {
+        if let proc = activeWakeProcess, proc.isRunning {
+            proc.terminate()
+        }
+        activeWakeProcess = nil
+    }
+
+    func handleWakeOutputLine(_ line: String, gpu: String, password: String) {
+        if line.hasPrefix("WAKE_URL:") {
+            let url = String(line.dropFirst("WAKE_URL:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            self.colabServerURL = url
+            self.adminPassword = password
+            self.wakeObtainedURLThisRun = true
+            self.liveConsoleLines.append(L(
+                "成功获取云端隧道地址: \(self.maskedURLDisplay(url))",
+                "Obtained public tunnel URL: \(self.maskedURLDisplay(url))"
+            ))
+            self.statusMessage = L(
+                "云端 \(gpu) 实例已唤醒就绪，正在同步模型状态...",
+                "Cloud \(gpu) instance is ready. Syncing model status..."
+            )
+        } else if line.hasPrefix("WAKE_ERROR:") {
+            let errBody = String(line.dropFirst("WAKE_ERROR:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayErr = errBody.isEmpty ? line : errBody
+            self.liveConsoleLines.append(displayErr)
+            self.statusMessage = L("唤醒失败: \(displayErr)", "Wake failed: \(displayErr)")
+        } else if line.hasPrefix("WAKE_LOG:") {
+            let clean = String(line.dropFirst("WAKE_LOG:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty {
+                self.liveConsoleLines.append(clean)
+                self.statusMessage = clean
+            }
+        } else if !line.hasPrefix("[colab]") && !line.contains("Assignment request failed") && !line.contains("urllib3") {
+            self.liveConsoleLines.append(line)
+        }
+    }
+
     func wakeColabHeadless() async {
         guard cliLoggedIn else {
             statusMessage = L("请先绑定 Google 账号后再使用免网页一键唤醒。", "Please bind your Google account before using headless 1-click wake.")
             return
         }
+        stopActiveWakeProcess()
+        stopKeepaliveDaemon()
+        wakeObtainedURLThisRun = false
         isWakingColab = true
         statusMessage = L(
             "正在通过 Google Colab API 后台分配 \(wakeGPUChoice) 实例并部署多模型引擎...",
@@ -250,46 +348,33 @@ extension StudioViewModel {
         let script = self.bridgeScript
         let gpu = self.wakeGPUChoice
         let password = UUID().uuidString + UUID().uuidString
+        let idleMin = self.idleTimeoutMinutes
         let appPy = self.appPyPath
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: pyBin)
+        proc.environment = ProcessInfo.processInfo.environment.merging([
+            "EASYCOLAB_ADMIN_PASSWORD": password,
+            "EASYCOLAB_IDLE_TIMEOUT_MINUTES": "\(idleMin)"
+        ]) { _, new in new }
+        proc.arguments = [script, "wake", "--gpu", gpu, "--app-py", appPy]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        self.activeWakeProcess = proc
+
+        let lineBuffer = KeepalivePipeLineBuffer()
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: pyBin)
-                proc.environment = ProcessInfo.processInfo.environment.merging(["EASYCOLAB_ADMIN_PASSWORD": password]) { _, new in new }
-                proc.arguments = [script, "wake", "--gpu", gpu, "--app-py", appPy]
-                let pipe = Pipe()
-                proc.standardOutput = pipe
-                proc.standardError = pipe
-
-                pipe.fileHandleForReading.readabilityHandler = { handle in
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                     let data = handle.availableData
-                    guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-                    let lines = chunk.components(separatedBy: .newlines)
-                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                        .filter { !$0.isEmpty }
-                    Task { @MainActor in
+                    guard !data.isEmpty else { return }
+                    let lines = lineBuffer.appendAndExtractLines(data)
+                    guard !lines.isEmpty else { return }
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
                         for line in lines {
-                            if line.hasPrefix("WAKE_URL:") {
-                                let url = String(line.dropFirst("WAKE_URL:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                                self.colabServerURL = url
-                                self.adminPassword = password
-                                self.liveConsoleLines.append(L(
-                                    "成功获取云端隧道地址: \(self.maskedURLDisplay(url))",
-                                    "Obtained public tunnel URL: \(self.maskedURLDisplay(url))"
-                                ))
-                                self.statusMessage = L(
-                                    "云端 \(gpu) 实例已唤醒就绪，正在同步模型状态...",
-                                    "Cloud \(gpu) instance is ready. Syncing model status..."
-                                )
-                            } else if line.hasPrefix("WAKE_ERROR:") {
-                                self.liveConsoleLines.append(line)
-                                self.statusMessage = L("唤醒失败: \(line)", "Wake failed: \(line)")
-                            } else {
-                                let clean = line.replacingOccurrences(of: "WAKE_LOG: ", with: "")
-                                self.liveConsoleLines.append(clean)
-                                self.statusMessage = clean
-                            }
+                            self.handleWakeOutputLine(line, gpu: gpu, password: password)
                         }
                     }
                 }
@@ -298,7 +383,8 @@ extension StudioViewModel {
                     try proc.run()
                     proc.waitUntilExit()
                 } catch {
-                    Task { @MainActor in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
                         self.statusMessage = L(
                             "启动唤醒进程失败: \(error.localizedDescription)",
                             "Failed to launch wake process: \(error.localizedDescription)"
@@ -306,19 +392,145 @@ extension StudioViewModel {
                     }
                 }
                 pipe.fileHandleForReading.readabilityHandler = nil
-                continuation.resume()
+                let tailData = pipe.fileHandleForReading.readDataToEndOfFile()
+                var finalLines = lineBuffer.appendAndExtractLines(tailData)
+                if let rem = lineBuffer.flushRemainingLine() {
+                    finalLines.append(rem)
+                }
+                let capturedFinal = finalLines
+                Task { @MainActor [weak self] in
+                    if let self {
+                        for line in capturedFinal {
+                            self.handleWakeOutputLine(line, gpu: gpu, password: password)
+                        }
+                    }
+                    continuation.resume()
+                }
             }
         }
 
+        if self.activeWakeProcess === proc {
+            self.activeWakeProcess = nil
+        }
         isWakingColab = false
         await refreshOfficialColabAccountUsage()
-        if !colabServerURL.isEmpty {
+        if wakeObtainedURLThisRun && !colabServerURL.isEmpty {
             await checkColabStatus()
+            await ensureKeepaliveDaemonRunning()
+        }
+    }
+
+    func stopKeepaliveDaemon() {
+        keepaliveDaemonStdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        try? keepaliveDaemonStdinPipe?.fileHandleForWriting.close()
+        if let proc = keepaliveDaemonProcess, proc.isRunning {
+            proc.terminate()
+        }
+        keepaliveDaemonProcess = nil
+        keepaliveDaemonStdinPipe = nil
+        keepaliveDaemonStdoutPipe = nil
+        keepaliveProxyWSConnected = false
+    }
+
+    func handleKeepaliveDaemonPayloadLine(_ jsonLine: String) {
+        guard let data = jsonLine.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(BridgeAuthStatusResponse.self, from: data) else {
+            return
+        }
+        if let logged = decoded.logged_in {
+            cliLoggedIn = logged
+        }
+        if let wsConn = decoded.ws_connected {
+            keepaliveProxyWSConnected = wsConn
+        }
+        if let bal = decoded.paid_balance {
+            officialCUBalance = bal
+            totalBudgetCU = bal
+        }
+        if let rate = decoded.burn_rate_hourly {
+            officialBurnRate = rate
+        }
+        if let count = decoded.active_assignments {
+            activeVMCount = count
+        }
+    }
+
+    func ensureKeepaliveDaemonRunning() async {
+        guard cliLoggedIn, isConnected, !isWakingColab, !isReleasingColab else { return }
+        if let existing = keepaliveDaemonProcess, existing.isRunning {
+            return
+        }
+        guard !isStartingKeepaliveDaemon else { return }
+        isStartingKeepaliveDaemon = true
+        defer { isStartingKeepaliveDaemon = false }
+
+        guard let pyBin = await ensureBridgePythonBin(installIfMissing: false) else { return }
+        guard cliLoggedIn, isConnected, !isWakingColab, !isReleasingColab else { return }
+        if let existing = keepaliveDaemonProcess, existing.isRunning {
+            return
+        }
+
+        stopKeepaliveDaemon()
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: pyBin)
+        proc.arguments = [self.bridgeScript, "keepalive_daemon"]
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        proc.standardInput = stdinPipe
+        proc.standardOutput = stdoutPipe
+        proc.standardError = FileHandle.nullDevice
+
+        let lineBuffer = KeepalivePipeLineBuffer()
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            let completeLines = lineBuffer.appendAndExtractPayloads(chunk)
+
+            if !completeLines.isEmpty {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    for payload in completeLines {
+                        self.handleKeepaliveDaemonPayloadLine(payload)
+                    }
+                }
+            }
+        }
+
+        proc.terminationHandler = { [weak self] exitedProc in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.keepaliveDaemonProcess === exitedProc {
+                    self.keepaliveDaemonStdoutPipe?.fileHandleForReading.readabilityHandler = nil
+                    try? self.keepaliveDaemonStdinPipe?.fileHandleForWriting.close()
+                    self.keepaliveDaemonProcess = nil
+                    self.keepaliveDaemonStdinPipe = nil
+                    self.keepaliveDaemonStdoutPipe = nil
+                    self.keepaliveProxyWSConnected = false
+                }
+            }
+        }
+
+        do {
+            try proc.run()
+            self.keepaliveDaemonProcess = proc
+            self.keepaliveDaemonStdinPipe = stdinPipe
+            self.keepaliveDaemonStdoutPipe = stdoutPipe
+        } catch {
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            try? stdinPipe.fileHandleForWriting.close()
         }
     }
 
     func keepaliveColabRuntime() async {
-        guard cliLoggedIn, !isWakingColab else { return }
+        guard cliLoggedIn, !isWakingColab, !isReleasingColab else { return }
+        if isConnected {
+            await ensureKeepaliveDaemonRunning()
+            if keepaliveDaemonProcess?.isRunning == true {
+                return
+            }
+        }
         let out = await runBridgeCommand(["keepalive"])
         guard let data = out.data(using: .utf8),
               let decoded = try? JSONDecoder().decode(BridgeAuthStatusResponse.self, from: data) else {
@@ -344,32 +556,26 @@ extension StudioViewModel {
                 tick += 1
                 if isConnected {
                     // 生成任务进行中由 pollColabJob 附带 telemetry 实时更新图表，仅每 15s 低频同步一次全局状态，避免争抢 Gradio 隧道
-                    if !isGenerating || tick % 6 == 0 {
+                    if !isReleasingColab && (!isGenerating || tick % 6 == 0) {
                         await checkColabStatus(silent: true)
                     }
-                } else if !normalizedBaseURL.isEmpty && tick % 4 == 0 {
-                    await checkColabStatus(silent: true)
+                    if cliLoggedIn && !isWakingColab && !isReleasingColab {
+                        await ensureKeepaliveDaemonRunning()
+                    }
+                } else {
+                    if keepaliveDaemonProcess != nil {
+                        stopKeepaliveDaemon()
+                    }
+                    if !isReleasingColab && !normalizedBaseURL.isEmpty && tick % 4 == 0 {
+                        await checkColabStatus(silent: true)
+                    }
                 }
 
-                // 每 ~80 秒：若处于生成任务或活跃保活窗口内，向 Colab 官方 Runtime Proxy 发送轻量保活脉冲，杜绝生成第 2 条视频中途被回收
-                if tick % 32 == 0 && cliLoggedIn && !isWakingColab {
-                    let shouldKeepalive = isConnected && (
-                        isGenerating
-                        || isDownloadingWeights
-                        || isLoadingModel
-                        || comfyStarting
-                        || comfyDownloadingWeight
-                        || comfyQueueRunning > 0
-                        || idleTimeoutMinutes <= 0
-                        || idleRemainingSeconds > 75
-                    )
-                    if shouldKeepalive {
-                        await keepaliveColabRuntime()
-                    } else {
-                        await refreshOfficialColabAccountUsage()
-                    }
-                } else if tick % 16 == 0 && cliLoggedIn && !isConnected {
+                // 未连接云端实例时每 ~40s 低频刷新一次官方 CU 余额与活跃分配数；已连接时由常驻 keepalive_daemon 实时回传
+                if tick % 16 == 0 && cliLoggedIn && !isWakingColab && !isReleasingColab && !isConnected {
                     await refreshOfficialColabAccountUsage()
+                } else if tick % 24 == 0 && cliLoggedIn && !isWakingColab && !isReleasingColab && isConnected && keepaliveDaemonProcess?.isRunning != true {
+                    await keepaliveColabRuntime()
                 }
             }
         }
@@ -562,6 +768,7 @@ extension StudioViewModel {
     }
 
     func applyStatusResponse(_ decoded: ColabStatusResponse) {
+        guard !isReleasingColab else { return }
         isConnected = true
         gpuName = decoded.gpu_name ?? "Colab GPU"
         vramFreeGB = decoded.vram_free_gb ?? 0.0
@@ -606,9 +813,11 @@ extension StudioViewModel {
         currentModelName = decoded.current_model ?? L(Self.defaultModelNameZh, Self.defaultModelNameEn)
         loadedContextLengthTokens = decoded.loaded_context_length ?? 0
 
-        if !remoteContextSynced {
-            remoteContextSynced = true
-            if let remoteCtx = decoded.context_length, remoteCtx != contextLengthTokens {
+        if let remoteCtx = decoded.context_length {
+            if remoteCtx == contextLengthTokens {
+                remoteContextSynced = true
+            } else if !remoteContextSynced && Date().timeIntervalSince(lastContextSyncAttemptAt) >= 8.0 {
+                lastContextSyncAttemptAt = Date()
                 Task { await syncContextLengthToColab() }
             }
         }
@@ -628,16 +837,24 @@ extension StudioViewModel {
         drivePersisted = decoded.drive_persisted ?? false
         isDownloadingWeights = decoded.is_downloading ?? false
         isLoadingModel = decoded.is_loading_vram ?? false
+        syncMacOSRuntimeActivityAssertion()
+        if cliLoggedIn && !isWakingColab && !isReleasingColab && keepaliveDaemonProcess?.isRunning != true {
+            Task { await ensureKeepaliveDaemonRunning() }
+        }
         if let p = decoded.task_progress { modelTaskProgress = p }
 
         uptimeSeconds = decoded.uptime_seconds ?? uptimeSeconds
         cuBurnRatePerHour = decoded.cu_burn_rate_per_hour ?? cuBurnRatePerHour
         sessionCUUsed = decoded.session_cu_used ?? sessionCUUsed
         idleRemainingSeconds = decoded.idle_remaining_seconds ?? idleRemainingSeconds
-        if !remoteIdleSynced {
-            remoteIdleSynced = true
-            if let remoteIdle = decoded.idle_timeout_minutes, remoteIdle != idleTimeoutMinutes {
-                Task { await updateIdleTimeoutConfig(idleTimeoutMinutes) }
+        if let remoteIdle = decoded.idle_timeout_minutes {
+            if remoteIdle == idleTimeoutMinutes {
+                remoteIdleSynced = true
+            } else if Date().timeIntervalSince(lastIdleSyncAttemptAt) >= 8.0 {
+                remoteIdleSynced = false
+                lastIdleSyncAttemptAt = Date()
+                let targetIdle = idleTimeoutMinutes
+                Task { await updateIdleTimeoutConfig(targetIdle) }
             }
         }
         apiRequestCount = decoded.api_request_count ?? apiRequestCount
@@ -1154,10 +1371,10 @@ extension StudioViewModel {
         let resolvedMod: String
         if modPref == "auto" {
             let lower = (repo + " " + inc).lowercased()
-            if lower.contains("video") || lower.contains("wan") || lower.contains("ltx") || lower.contains("minimax") || lower.contains("hunyuan") {
-                resolvedMod = "video_audio"
-            } else if lower.contains("flux") || lower.contains("image") || lower.contains("sdxl") || lower.contains("z-image") {
+            if lower.contains("flux") || lower.contains("image") || lower.contains("sdxl") || lower.contains("z-image") {
                 resolvedMod = "image"
+            } else if lower.contains("video") || lower.contains("wan") || lower.contains("ltx") || lower.contains("minimax") || lower.contains("hunyuan") {
+                resolvedMod = "video_audio"
             } else {
                 resolvedMod = "llm_vlm"
             }

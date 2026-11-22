@@ -15,7 +15,7 @@ SPEC_DIR = Path(SPECPATH).resolve()
 PROJECT_ROOT = SPEC_DIR.parent
 ICON_PATH = SPEC_DIR / "assets" / "AppIcon.ico"
 VERSION_FILE = PROJECT_ROOT / "VERSION"
-APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.is_file() else "1.2.0"
+APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.is_file() else "1.2.1"
 _ver_nums = [int(x) for x in re.findall(r"\d+", APP_VERSION)[:4]]
 while len(_ver_nums) < 4:
     _ver_nums.append(0)

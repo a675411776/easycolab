@@ -66,6 +66,10 @@ class StudioViewModel: ObservableObject {
             if Self.normalizeServerURL(oldValue) != Self.normalizeServerURL(colabServerURL) {
                 adminPassword = Self.savedAdminPassword(for: colabServerURL)
                 remoteApiKeySynced = false
+                remoteIdleSynced = false
+                remoteContextSynced = false
+                lastIdleSyncAttemptAt = .distantPast
+                lastContextSyncAttemptAt = .distantPast
             }
             UserDefaults.standard.set(colabServerURL, forKey: "colabServerURL")
             syncLocalGatewaySnapshot()
@@ -138,11 +142,17 @@ class StudioViewModel: ObservableObject {
     }() {
         didSet { UserDefaults.standard.set(wakeGPUChoice, forKey: "wakeGPUChoiceV2") }
     }
-    @Published var isWakingColab: Bool = false
+    @Published var isWakingColab: Bool = false {
+        didSet { syncMacOSRuntimeActivityAssertion() }
+    }
+    @Published var isReleasingColab: Bool = false
 
     // 远端 GPU 与多模型驻留状态
     @Published var isConnected: Bool = false {
-        didSet { syncLocalGatewaySnapshot() }
+        didSet {
+            syncLocalGatewaySnapshot()
+            syncMacOSRuntimeActivityAssertion()
+        }
     }
     @Published var gpuName: String = L(StudioViewModel.defaultGpuNameZh, StudioViewModel.defaultGpuNameEn) {
         didSet { let c = stripEmoji(gpuName); if c != gpuName { gpuName = c } }
@@ -390,7 +400,9 @@ class StudioViewModel: ObservableObject {
     @Published var localProxyRequestCount: Int = 0
 
     // 任务进度与生成耗时状态
-    @Published var isGenerating: Bool = false
+    @Published var isGenerating: Bool = false {
+        didSet { syncMacOSRuntimeActivityAssertion() }
+    }
     @Published var progressValue: Double = 0.0
     @Published var currentJobElapsed: Double = 0.0
     @Published var lastCompletedElapsed: Double? = nil
@@ -483,6 +495,37 @@ class StudioViewModel: ObservableObject {
     var consecutiveStatusFailures: Int = 0
     var lastTelemetrySampleDate: Date = .distantPast
     let maxTelemetrySamples: Int = 48
+
+    // macOS 防 App Nap 休眠断言与常驻外部 Runtime Proxy 保活守护进程状态
+    var runtimeActivityToken: NSObjectProtocol? = nil
+    var activeWakeProcess: Process? = nil
+    var wakeObtainedURLThisRun: Bool = false
+    var keepaliveDaemonProcess: Process? = nil
+    var keepaliveDaemonStdinPipe: Pipe? = nil
+    var keepaliveDaemonStdoutPipe: Pipe? = nil
+    var isStartingKeepaliveDaemon: Bool = false
+    @Published var keepaliveProxyWSConnected: Bool = false
+    var lastIdleSyncAttemptAt: Date = .distantPast
+    var lastContextSyncAttemptAt: Date = .distantPast
+    var lastLocalInteractionAt: Date = Date()
+    var lastRemoteTouchSentAt: Date = .distantPast
+    var localEventMonitor: Any? = nil
+    var appTerminateObserver: NSObjectProtocol? = nil
+
+    func syncMacOSRuntimeActivityAssertion() {
+        let shouldHold = isConnected || isWakingColab || isGenerating || isDownloadingWeights || isLoadingModel
+        if shouldHold {
+            if runtimeActivityToken == nil {
+                runtimeActivityToken = ProcessInfo.processInfo.beginActivity(
+                    options: [.userInitiated],
+                    reason: "EasyColab active cloud GPU session keepalive & telemetry"
+                )
+            }
+        } else if let token = runtimeActivityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            runtimeActivityToken = nil
+        }
+    }
 
     func recordTelemetrySample(force: Bool = false) {
         let now = Date()
@@ -595,6 +638,7 @@ class StudioViewModel: ObservableObject {
             || isAutoLoadQueuedAfterDownload
             || vramTotalGB > 0
 
+        stopKeepaliveDaemon()
         stopLiveGenerationTimer()
         isConnected = false
         modelLoaded = false
@@ -641,6 +685,9 @@ class StudioViewModel: ObservableObject {
         remoteContextSynced = false
         remoteIdleSynced = false
         remoteApiKeySynced = false
+        lastIdleSyncAttemptAt = .distantPast
+        lastContextSyncAttemptAt = .distantPast
+        syncMacOSRuntimeActivityAssertion()
         gpuName = L(Self.defaultGpuNameZh, Self.defaultGpuNameEn)
 
         if hadActiveState && !reason.isEmpty {
@@ -788,6 +835,22 @@ class StudioViewModel: ObservableObject {
         }
         applyLocalProxyConfig()
         startBackgroundTelemetryLoop()
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel]
+        ) { [weak self] event in
+            self?.lastLocalInteractionAt = Date()
+            return event
+        }
+        appTerminateObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.stopActiveWakeProcess()
+                self?.stopKeepaliveDaemon()
+            }
+        }
         languageObserver = NotificationCenter.default.addObserver(
             forName: .easyColabLanguageDidChange,
             object: nil,
@@ -816,6 +879,12 @@ class StudioViewModel: ObservableObject {
 
     deinit {
         localGateway.stop()
+        if let localEventMonitor {
+            NSEvent.removeMonitor(localEventMonitor)
+        }
+        if let appTerminateObserver {
+            NotificationCenter.default.removeObserver(appTerminateObserver)
+        }
         if let languageObserver {
             NotificationCenter.default.removeObserver(languageObserver)
         }
@@ -1018,8 +1087,14 @@ class StudioViewModel: ObservableObject {
 
     func checkColabStatus(silent: Bool = false) async {
         let base = normalizedBaseURL
+        let now = Date()
+        let shouldTouchActivity = !silent || (
+            now.timeIntervalSince(lastLocalInteractionAt) < 30.0
+            && now.timeIntervalSince(lastRemoteTouchSentAt) >= 20.0
+        )
+        let touchSuffix = shouldTouchActivity ? "&touch=1" : ""
         guard !base.isEmpty,
-              let url = URL(string: "\(base)/minimax_api/status?model_id=\(selectedModelId)") else {
+              let url = URL(string: "\(base)/minimax_api/status?model_id=\(selectedModelId)\(touchSuffix)") else {
             if !silent {
                 statusMessage = L(
                     "请先填入服务地址，或点击左侧「唤醒实例并部署」。",
@@ -1028,6 +1103,9 @@ class StudioViewModel: ObservableObject {
             }
             isConnected = false
             return
+        }
+        if shouldTouchActivity {
+            lastRemoteTouchSentAt = now
         }
 
         if !silent {
@@ -1146,6 +1224,8 @@ class StudioViewModel: ObservableObject {
 
     func updateIdleTimeoutConfig(_ minutes: Int) async {
         idleTimeoutMinutes = minutes
+        remoteIdleSynced = false
+        lastIdleSyncAttemptAt = Date()
         let base = normalizedBaseURL
         guard isConnected, !base.isEmpty, let url = URL(string: "\(base)/minimax_api/config_idle") else { return }
         do {
@@ -1155,6 +1235,9 @@ class StudioViewModel: ObservableObject {
             req.httpBody = try JSONSerialization.data(withJSONObject: ["idle_timeout_minutes": minutes])
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
+            if decoded.idle_timeout_minutes == minutes {
+                remoteIdleSynced = true
+            }
             applyStatusResponse(decoded)
         } catch {}
     }
@@ -1865,6 +1948,11 @@ class StudioViewModel: ObservableObject {
     }
 
     func disconnectRemoteColab() async {
+        guard !isReleasingColab else { return }
+        isReleasingColab = true
+        defer { isReleasingColab = false }
+        stopActiveWakeProcess()
+        stopKeepaliveDaemon()
         statusMessage = L(
             "正在释放云端 Colab 实例并同步账户计费状态...",
             "Terminating cloud Colab instances & syncing billing status..."
@@ -1895,6 +1983,7 @@ class StudioViewModel: ObservableObject {
             )
         }
 
+        stopKeepaliveDaemon()
         stopLiveGenerationTimer()
         isConnected = false
         modelLoaded = false
@@ -1921,8 +2010,11 @@ class StudioViewModel: ObservableObject {
         remoteContextSynced = false
         remoteIdleSynced = false
         remoteApiKeySynced = false
+        lastIdleSyncAttemptAt = .distantPast
+        lastContextSyncAttemptAt = .distantPast
         uptimeSeconds = 0
         cuBurnRatePerHour = 0.0
+        syncMacOSRuntimeActivityAssertion()
     }
 
     func encodeImageToBase64(_ image: NSImage) -> String? {

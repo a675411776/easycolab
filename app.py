@@ -14,9 +14,22 @@ import asyncio
 import atexit
 import socket
 import base64
+import contextlib
 import secrets
 import signal
-from runtime_auth import authenticated_ingress, COMFY_BACKEND, COMFY_INGRESS, GRADIO_BACKEND, GRADIO_INGRESS
+try:
+    from runtime_auth import authenticated_ingress, COMFY_BACKEND, COMFY_INGRESS, GRADIO_BACKEND, GRADIO_INGRESS
+except ImportError:
+    authenticated_ingress = None
+    GRADIO_INGRESS = 7860
+    GRADIO_BACKEND = 27860
+    COMFY_INGRESS = 8188
+    COMFY_BACKEND = 28188
+if __name__ == "__main__" and not _DEPLOY_PASSWORD and (
+    authenticated_ingress is None or sys.stdin is None or not sys.stdin.isatty()
+):
+    GRADIO_BACKEND = GRADIO_INGRESS
+    COMFY_BACKEND = COMFY_INGRESS
 import subprocess
 import threading
 from collections import deque
@@ -1090,7 +1103,10 @@ from pydantic import BaseModel
 # ==============================================================================
 BOOT_TIME = time.time()
 LAST_ACTIVE_TIME = time.time()
-IDLE_TIMEOUT_MINUTES = 30  # 默认闲置 30 分钟自动释放 Colab 虚拟机，可在 Mac 端调节
+try:
+    IDLE_TIMEOUT_MINUTES = int(os.environ.get("EASYCOLAB_IDLE_TIMEOUT_MINUTES", "30").strip())
+except Exception:
+    IDLE_TIMEOUT_MINUTES = 30  # 默认闲置 30 分钟自动释放 Colab 虚拟机，可在 Mac 端调节
 
 import gc
 
@@ -1105,9 +1121,10 @@ INITIAL_API_KEY = secrets.token_urlsafe(32)
 API_AUTH_KEY = INITIAL_API_KEY
 API_KEY_LOCK = threading.Lock()
 API_REQUEST_COUNT = 0
-import contextlib
 
 GPU_LOCK = threading.Lock()
+_ACTIVE_API_STREAMS = 0
+_ACTIVE_API_STREAMS_LOCK = threading.Lock()
 
 
 class _GGUFRWLock:
@@ -1326,10 +1343,19 @@ def setup_colab_ramdisk() -> Optional[str]:
 RAM_ROOT_DIR = setup_colab_ramdisk()
 
 # 如果挂载了 Google Drive，优先将模型持久化保存在云盘 EasyColab_Models（并自动兼容读取历史 Aevix_Models / MiniMax_H3_Models 目录）
-DRIVE_MOUNTED = os.path.exists("/content/drive/MyDrive")
+def _is_drive_mounted_live() -> bool:
+    if not os.path.isdir("/content/drive/MyDrive"):
+        return False
+    if os.path.exists("/content"):
+        try:
+            return os.stat("/content/drive/MyDrive").st_dev != os.stat("/content").st_dev
+        except Exception:
+            return False
+    return True
 
 
-_RCLONE_DRIVE_PROBE_CACHE: Dict[str, Any] = {"mtime": -1.0, "usable": False}
+DRIVE_MOUNTED = _is_drive_mounted_live()
+_RCLONE_DRIVE_PROBE_CACHE: Dict[str, Any] = {"mtime": -1.0, "ts": 0.0, "ok": False}
 _RCLONE_PROBE_LOCK = threading.Lock()
 
 
@@ -1340,27 +1366,39 @@ def _has_rclone_drive_remote() -> bool:
     try:
         st_mtime = float(os.path.getmtime(rc_path))
         with open(rc_path, "r", encoding="utf-8", errors="ignore") as f:
-            if "[easycolab_gdrive]" not in f.read():
-                return False
+            txt = f.read()
+        if "[easycolab_gdrive]" not in txt:
+            return False
+        # 公共 ADC Client (764086051850-*) 无 quota_project 时会被 Google Drive API 403 拒绝，不可视为有效云盘远程
+        if "client_id = 764086051850-" in txt:
+            return False
+        lock_ctx = globals().get("_RCLONE_PROBE_LOCK")
+        if lock_ctx is not None:
+            lock_ctx.acquire()
+        try:
+            now = time.time()
+            if (
+                _RCLONE_DRIVE_PROBE_CACHE.get("mtime") == st_mtime
+                and (_RCLONE_DRIVE_PROBE_CACHE.get("ok") or (now - float(_RCLONE_DRIVE_PROBE_CACHE.get("ts", 0.0))) < 120.0)
+            ):
+                return bool(_RCLONE_DRIVE_PROBE_CACHE.get("ok"))
+            probe = subprocess.run(
+                ["rclone", "about", "easycolab_gdrive:", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            ok = probe.returncode == 0
+            _RCLONE_DRIVE_PROBE_CACHE["mtime"] = st_mtime
+            _RCLONE_DRIVE_PROBE_CACHE["ts"] = now
+            _RCLONE_DRIVE_PROBE_CACHE["ok"] = ok
+            return ok
+        finally:
+            if lock_ctx is not None:
+                lock_ctx.release()
     except Exception:
         return False
-    with _RCLONE_PROBE_LOCK:
-        if _RCLONE_DRIVE_PROBE_CACHE.get("mtime") == st_mtime:
-            return bool(_RCLONE_DRIVE_PROBE_CACHE.get("usable", False))
-        usable = False
-        try:
-            proc = subprocess.run(
-                ["rclone", "lsd", "easycolab_gdrive:", "--contimeout", "3s", "--timeout", "5s"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=7,
-            )
-            usable = proc.returncode == 0
-        except Exception:
-            usable = False
-        _RCLONE_DRIVE_PROBE_CACHE["mtime"] = st_mtime
-        _RCLONE_DRIVE_PROBE_CACHE["usable"] = usable
-        return usable
 
 
 COMFYUI_LOCK = threading.Lock()
@@ -2528,6 +2566,98 @@ os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 os.makedirs(os.path.join(os.getcwd(), "models"), exist_ok=True)
 
 
+def _refresh_drive_mount_state() -> bool:
+    """动态检测 Google Drive 真实挂载状态并实时更新模型与成片输出目录（支持运行中热挂载生效）"""
+    global DRIVE_MOUNTED, MODEL_BASE_ROOT, DEFAULT_OUTPUT_DIR
+    mounted = _is_drive_mounted_live()
+    if mounted != DRIVE_MOUNTED:
+        DRIVE_MOUNTED = mounted
+        MODEL_BASE_ROOT = (
+            "/content/drive/MyDrive/EasyColab_Models"
+            if mounted
+            else os.path.join(os.getcwd(), "models")
+        )
+        os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = MODEL_BASE_ROOT
+        DEFAULT_OUTPUT_DIR = (
+            "/content/drive/MyDrive/EasyColab_Outputs"
+            if mounted
+            else os.path.join(os.getcwd(), "outputs")
+        )
+        try:
+            os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
+            if mounted:
+                os.makedirs(MODEL_BASE_ROOT, exist_ok=True)
+        except Exception:
+            pass
+    return DRIVE_MOUNTED
+
+
+def _flush_drive_file(file_path: str) -> None:
+    """强制将写入 /content/drive/MyDrive 的成片刷盘至 DriveFS 守护进程，防止生成后立即释放实例导致文件丢失"""
+    if not file_path or not os.path.exists(file_path):
+        return
+    try:
+        with open(file_path, "rb+") as f:
+            os.fsync(f.fileno())
+    except Exception:
+        try:
+            with open(file_path, "rb") as f:
+                os.fsync(f.fileno())
+        except Exception:
+            pass
+    if hasattr(os, "sync") and file_path.startswith("/content/drive/"):
+        try:
+            os.sync()
+        except Exception:
+            pass
+
+
+def _persist_generated_output_to_drive(output_path: str) -> str:
+    """确保生成的视频或图片真正持久化到 Google Drive（原生挂载实时刷盘或自定义 rclone 远端同步）"""
+    if not output_path or not os.path.exists(output_path):
+        return output_path
+    mounted = _refresh_drive_mount_state()
+    if mounted:
+        if not output_path.startswith("/content/drive/MyDrive/"):
+            drive_out_dir = "/content/drive/MyDrive/EasyColab_Outputs"
+            try:
+                os.makedirs(drive_out_dir, exist_ok=True)
+                dst_path = os.path.join(drive_out_dir, os.path.basename(output_path))
+                shutil.copy2(output_path, dst_path)
+                _flush_drive_file(dst_path)
+                return dst_path
+            except Exception as e:
+                print(
+                    f"[Google Drive 写入回退] 复制 {os.path.basename(output_path)} 至挂载盘失败 ({e})，回退使用本地成片路径",
+                    flush=True,
+                )
+                return output_path
+        _flush_drive_file(output_path)
+        return output_path
+    if _has_rclone_drive_remote():
+        try:
+            cp_res = subprocess.run(
+                [
+                    "rclone", "copy",
+                    output_path,
+                    "easycolab_gdrive:EasyColab_Drive/EasyColab_Outputs",
+                    "--drive-chunk-size", "64M",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            if cp_res.returncode == 0:
+                print(f"[Google Drive 同步完成] {os.path.basename(output_path)} -> EasyColab_Drive/EasyColab_Outputs")
+            else:
+                err_tail = (cp_res.stderr or cp_res.stdout or "").strip()[-200:]
+                print(f"[Google Drive 同步失败] {os.path.basename(output_path)}: {err_tail}")
+        except Exception as sync_err:
+            print(f"[Google Drive 同步异常] {os.path.basename(output_path)}: {sync_err}")
+    return output_path
+
+
 # ==============================================================================
 # 借鉴 comfy-colab-kit 的 8 线程 HTTP Range 并行极速下载器 (400~700 MB/s)
 # ==============================================================================
@@ -2657,36 +2787,308 @@ def fast_parallel_hf_download(
 
 
 _LAST_JUPYTER_HEARTBEAT_TS: float = 0.0
+_JUPYTER_HB_WAKE_EVENT = threading.Event()
+_STOP_JUPYTER_KEEPALIVE = False
+
+
+def _build_ws_masked_text_frame(text: str) -> bytes:
+    """构建标准 RFC 6455 客户端掩码文本帧 (opcode=0x1, FIN=1)，零第三方依赖连接本地 Jupyter WebSocket"""
+    payload = text.encode("utf-8")
+    length = len(payload)
+    mask_key = os.urandom(4)
+    header = bytearray([0x81])
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 65536:
+        header.append(0x80 | 126)
+        header.extend(length.to_bytes(2, "big"))
+    else:
+        header.append(0x80 | 127)
+        header.extend(length.to_bytes(8, "big"))
+    header.extend(mask_key)
+    masked = bytearray(length)
+    for i in range(length):
+        masked[i] = payload[i] ^ mask_key[i & 3]
+    return bytes(header) + bytes(masked)
+
+
+def _build_ws_masked_pong_frame(payload: bytes = b"") -> bytes:
+    mask_key = os.urandom(4)
+    length = min(len(payload), 125)
+    header = bytearray([0x8A, 0x80 | length])
+    header.extend(mask_key)
+    masked = bytes(payload[i] ^ mask_key[i & 3] for i in range(length))
+    return bytes(header) + masked
+
+
+def _ensure_local_colab_kernel_id() -> Optional[str]:
+    """查询或启动本地 127.0.0.1:8080 上的 Jupyter 内核并返回 kernel_id"""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Colab-Client-Agent": "vscode",
+    }
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8080/api/kernels", headers=headers)
+        with opener.open(req, timeout=3.0) as resp:
+            kernels = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if isinstance(kernels, list) and kernels:
+            for k in kernels:
+                kid = k.get("id")
+                if kid:
+                    return str(kid)
+    except Exception:
+        return None
+
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8080/api/kernels",
+            data=b'{"name":"python3"}',
+            headers=headers,
+            method="POST",
+        )
+        with opener.open(req, timeout=5.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        kid = data.get("id")
+        if kid:
+            return str(kid)
+    except Exception:
+        pass
+    return None
+
+
+def _open_local_jupyter_ws_channel(kernel_id: str, session_id: str) -> Optional[socket.socket]:
+    """建立到 ws://127.0.0.1:8080/api/kernels/<id>/channels 的常驻 WebSocket 连接，使内核 connections 始终 >= 1"""
+    sock = None
+    try:
+        sock = socket.create_connection(("127.0.0.1", 8080), timeout=5.0)
+        ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        path = f"/api/kernels/{kernel_id}/channels?session_id={session_id}"
+        handshake = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:8080\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"X-Colab-Client-Agent: vscode\r\n"
+            f"Origin: http://127.0.0.1:8080\r\n\r\n"
+        )
+        sock.sendall(handshake.encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < 8192:
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            buf += chunk
+        status_line = buf.split(b"\r\n", 1)[0]
+        if b" 101 " not in status_line:
+            sock.close()
+            return None
+        sock.settimeout(0.2)
+        return sock
+    except Exception:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        return None
+
+
+def _recv_ws_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("WebSocket EOF mid-frame")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _recv_ws_frame(sock: socket.socket, poll_timeout: float = 0.2) -> Optional[Tuple[int, bytes]]:
+    """
+    严格按 RFC 6455 帧边界解析单帧，返回 (opcode, payload)。
+    首个字节到达前若超时无数据返回 None；对端断开连接则抛出 ConnectionError。
+    杜绝直接用 sock.recv(4096)[0] & 0x0F 将分片 JSON 载荷字节 ('h'/'x'/'8'/'(') 误判为 Close 帧。
+    """
+    prev_timeout = sock.gettimeout()
+    try:
+        sock.settimeout(poll_timeout)
+        try:
+            first_two = sock.recv(2)
+        except socket.timeout:
+            return None
+        if not first_two:
+            raise ConnectionError("WebSocket closed by peer")
+        sock.settimeout(2.5)
+        if len(first_two) == 1:
+            first_two += _recv_ws_exact(sock, 1)
+        b0, b1 = first_two[0], first_two[1]
+        opcode = b0 & 0x0F
+        masked = (b1 & 0x80) != 0
+        payload_len = b1 & 0x7F
+        if payload_len == 126:
+            payload_len = int.from_bytes(_recv_ws_exact(sock, 2), "big")
+        elif payload_len == 127:
+            payload_len = int.from_bytes(_recv_ws_exact(sock, 8), "big")
+        if payload_len > 32 * 1024 * 1024:
+            raise ConnectionError(f"Oversized WebSocket frame: {payload_len}")
+        mask_key = _recv_ws_exact(sock, 4) if masked else b""
+        payload = _recv_ws_exact(sock, payload_len) if payload_len > 0 else b""
+        if masked and payload:
+            payload = bytes(payload[i] ^ mask_key[i & 3] for i in range(payload_len))
+        return opcode, payload
+    finally:
+        try:
+            sock.settimeout(prev_timeout)
+        except Exception:
+            pass
+
+
+def _drain_local_ws_frames(sock: socket.socket, max_frames: int = 24, poll_timeout: float = 0.15) -> bool:
+    """按完整 RFC 6455 帧排空本地 Jupyter WebSocket 缓冲区：收到 Ping 回显原 payload Pong，收到 Close 返回 False"""
+    try:
+        for idx in range(max_frames):
+            frame = _recv_ws_frame(sock, poll_timeout=poll_timeout if idx == 0 else 0.05)
+            if frame is None:
+                break
+            opcode, payload = frame
+            if opcode == 0x08:
+                return False
+            if opcode == 0x09:
+                sock.sendall(_build_ws_masked_pong_frame(payload))
+        return True
+    except Exception:
+        return False
+
+
+def _send_jupyter_ws_execute_heartbeat(sock: socket.socket, session_id: str) -> bool:
+    """在已连接的本地 Jupyter WebSocket 通道上发送轻量 execute_request，真实刷新内核 last_activity 与 execution_state"""
+    msg = {
+        "channel": "shell",
+        "header": {
+            "msg_id": uuid.uuid4().hex,
+            "username": "easycolab",
+            "session": session_id,
+            "date": datetime.utcnow().isoformat() + "Z",
+            "msg_type": "execute_request",
+            "version": "5.3",
+        },
+        "parent_header": {},
+        "metadata": {},
+        "content": {
+            "code": "_easycolab_hb = 1",
+            "silent": False,
+            "store_history": False,
+            "user_expressions": {},
+            "allow_stdin": False,
+            "stop_on_error": False,
+        },
+    }
+    try:
+        frame = _build_ws_masked_text_frame(json.dumps(msg))
+        sock.sendall(frame)
+        return _drain_local_ws_frames(sock, max_frames=32, poll_timeout=0.25)
+    except Exception:
+        return False
+
+
+def _local_jupyter_ws_keepalive_loop():
+    """
+    后台守护线程：只要当前处于活跃保活窗口内，始终保持一条连接到本地 Colab Jupyter Server
+    (ws://127.0.0.1:8080/api/kernels/<id>/channels) 的常驻 WebSocket，确保内核 connections >= 1，
+    并每 30 秒发送一次 execute_request 脉冲刷新 last_activity，彻底杜绝无网页模式下被 Colab 误判闲置回收。
+    """
+    session_id = uuid.uuid4().hex
+    ws_sock: Optional[socket.socket] = None
+    active_kid: Optional[str] = None
+    last_exec_ts = 0.0
+
+    while not _STOP_JUPYTER_KEEPALIVE:
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            for ep in ("http://127.0.0.1:8080/api/kernels", "http://127.0.0.1:8080/api/sessions", "http://127.0.0.1:8080/api/status"):
+                try:
+                    req = urllib.request.Request(ep, headers={"X-Colab-Client-Agent": "vscode"})
+                    with opener.open(req, timeout=2.0) as resp:
+                        resp.read(256)
+                except Exception:
+                    pass
+
+            if ws_sock is None:
+                active_kid = _ensure_local_colab_kernel_id()
+                if active_kid:
+                    ws_sock = _open_local_jupyter_ws_channel(active_kid, session_id)
+                    last_exec_ts = 0.0
+
+            now = time.time()
+            if ws_sock is not None and (now - last_exec_ts >= 30.0 or _JUPYTER_HB_WAKE_EVENT.is_set()):
+                if _send_jupyter_ws_execute_heartbeat(ws_sock, session_id):
+                    last_exec_ts = now
+                else:
+                    try:
+                        ws_sock.close()
+                    except Exception:
+                        pass
+                    ws_sock = None
+            elif ws_sock is not None:
+                # 非发送周期也按 RFC 6455 帧边界排空控制帧，保持连接健康
+                if not _drain_local_ws_frames(ws_sock, max_frames=16, poll_timeout=0.15):
+                    try:
+                        ws_sock.close()
+                    except Exception:
+                        pass
+                    ws_sock = None
+        except Exception:
+            pass
+
+        _JUPYTER_HB_WAKE_EVENT.wait(timeout=5.0)
+        _JUPYTER_HB_WAKE_EVENT.clear()
+
+    if ws_sock is not None:
+        try:
+            ws_sock.close()
+        except Exception:
+            pass
+
+
+threading.Thread(target=_local_jupyter_ws_keepalive_loop, daemon=True).start()
 
 
 def _ping_local_colab_jupyter(force: bool = False):
-    """
-    在活跃推理/下载期间定期轻触本地 Colab Jupyter Server (127.0.0.1:8080/api/kernels)，
-    避免无网页模式下推理流量全走 gradio.live 导致 Colab 误判容器闲置而在生成第 2 条视频中途回收实例。
-    """
+    """触发本地常驻 Jupyter WebSocket 保活线程立即执行一次脉冲"""
     global _LAST_JUPYTER_HEARTBEAT_TS
     now = time.time()
-    if not force and (now - _LAST_JUPYTER_HEARTBEAT_TS) < 40.0:
+    if not force and (now - _LAST_JUPYTER_HEARTBEAT_TS) < 25.0:
         return
     _LAST_JUPYTER_HEARTBEAT_TS = now
-
-    def _do_ping():
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        for ep in ("http://127.0.0.1:8080/api/kernels", "http://127.0.0.1:8080/api/status"):
-            try:
-                req = urllib.request.Request(ep, headers={"X-Colab-Client-Agent": "colab-cli"})
-                with opener.open(req, timeout=2.0) as resp:
-                    resp.read(256)
-            except Exception:
-                pass
-
-    threading.Thread(target=_do_ping, daemon=True).start()
+    _JUPYTER_HB_WAKE_EVENT.set()
 
 
 def touch_activity():
     global LAST_ACTIVE_TIME
     LAST_ACTIVE_TIME = time.time()
     _ping_local_colab_jupyter(force=False)
+
+
+class _ActiveApiStreamGuard:
+    """标记当前正在进行的流式/长耗时网关请求，避免长思维链生成期间被闲置看门狗误判"""
+
+    def __enter__(self):
+        global _ACTIVE_API_STREAMS
+        with _ACTIVE_API_STREAMS_LOCK:
+            _ACTIVE_API_STREAMS += 1
+        touch_activity()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _ACTIVE_API_STREAMS
+        with _ACTIVE_API_STREAMS_LOCK:
+            _ACTIVE_API_STREAMS = max(0, _ACTIVE_API_STREAMS - 1)
+        touch_activity()
+        return False
 
 
 def estimate_cu_burn_rate(gpu_name: str) -> float:
@@ -2709,14 +3111,26 @@ def estimate_cu_burn_rate(gpu_name: str) -> float:
 
 def _idle_watchdog_loop():
     """借鉴 comfy-colab-kit 的 stopper.py：当超过设定闲置时间无任务时自动释放 Colab 虚拟机"""
+    global _STOP_JUPYTER_KEEPALIVE
     while True:
         time.sleep(15)
-        # 若正在下载、加载模型、生成视频/LLM推理或 ComfyUI 正在安装/执行节点队列，持续刷新活跃时间并向本地 Jupyter 发送保活脉冲
+        # 检查客户端桥接层 (cmd_keepalive) 写入的保活时间戳文件
+        try:
+            if os.path.exists("/tmp/.easycolab_client_hb"):
+                hb_mtime = os.path.getmtime("/tmp/.easycolab_client_hb")
+                if hb_mtime > LAST_ACTIVE_TIME:
+                    touch_activity()
+        except Exception:
+            pass
+
+        # 若正在下载、加载模型、生成视频/LLM推理或 ComfyUI 正在运行/安装/执行节点队列，持续刷新活跃时间并向本地 Jupyter 发送保活脉冲
         if (
             MODEL_DOWNLOAD_STATE["is_downloading"]
             or MODEL_DOWNLOAD_STATE["is_loading_vram"]
             or GPU_LOCK.locked()
             or GGUF_RW_LOCK.is_busy()
+            or _ACTIVE_API_STREAMS > 0
+            or COMFYUI_STATE.get("is_running")
             or COMFYUI_STATE["is_starting"]
             or COMFYUI_STATE["is_downloading_weight"]
             or COMFYUI_STATE["queue_running"] > 0
@@ -2731,6 +3145,8 @@ def _idle_watchdog_loop():
 
         idle_sec = time.time() - LAST_ACTIVE_TIME
         if idle_sec >= IDLE_TIMEOUT_MINUTES * 60:
+            _STOP_JUPYTER_KEEPALIVE = True
+            _JUPYTER_HB_WAKE_EVENT.set()
             print(f"🛑 [自动省额度看门狗] 已连续闲置 {IDLE_TIMEOUT_MINUTES} 分钟，正在自动释放 Colab 虚拟机...")
             disconnect_colab_runtime()
             break
@@ -2742,14 +3158,46 @@ def _idle_watchdog_loop():
 threading.Thread(target=_idle_watchdog_loop, daemon=True).start()
 
 
+def _safe_shm_available_bytes(reserve_ram_gb: float = 34.0) -> int:
+    """
+    计算 /dev/shm 内存盘真正可安全写入的字节数：
+    Colab 容器中 /dev/shm (tmpfs) 与进程匿名内存共享同一个 Cgroup 物理内存上限（如 G4 176GB）。
+    若 MiniMax-H3 已锁入 ~128GB 系统内存热备，shutil.disk_usage('/dev/shm').free 仍会虚报 ~88GB 空闲，
+    此时继续向 /dev/shm 写入大权重会直接击穿容器 Cgroup 触发 OOM 强杀。
+    因此必须同时受限于 /dev/shm 配额剩余空间与 /proc/meminfo MemAvailable 安全余量。
+    """
+    if not os.path.exists("/dev/shm"):
+        return 0
+    try:
+        shm_free = int(shutil.disk_usage("/dev/shm").free)
+    except Exception:
+        return 0
+    total_ram_gb, avail_ram_gb = _get_system_ram_gb()
+    if total_ram_gb > 0:
+        eff_reserve = reserve_ram_gb
+        try:
+            if any(
+                ("内存热备" in str(rt.get("mode_label", "")) or "ComponentsManager" in str(rt.get("mode_label", "")))
+                for rt in LOADED_RUNTIMES.values()
+            ):
+                eff_reserve = max(eff_reserve, 40.0)
+        except Exception:
+            pass
+        ram_budget = max(0, int((avail_ram_gb - eff_reserve) * (1024 ** 3)))
+        return min(shm_free, ram_budget)
+    return shm_free
+
+
 def _get_model_dirs(model_id: str) -> Tuple[Optional[str], str, str]:
     """返回指定模型的 (RAM内存盘目录或None, 本地高速NVMe目录, Google Drive/持久盘目录)"""
     spec = MODEL_CATALOG.get(model_id, MODEL_CATALOG["minimax_h3"])
     repo_sub = spec["repo_id"]
+    pipeline_arch = spec.get("pipeline_arch") or model_id
     ram_dir = None
-    if os.path.exists("/dev/shm"):
+    # MiniMax-H3 (~134GB) 推理期依赖 CPU DDR5 内存热备，禁止拷入 /dev/shm 以免与匿名内存争抢 Cgroup 上限
+    if os.path.exists("/dev/shm") and pipeline_arch != "minimax_h3":
         try:
-            shm_free_gb = shutil.disk_usage("/dev/shm").free / (1024 ** 3)
+            shm_free_gb = _safe_shm_available_bytes(reserve_ram_gb=34.0) / (1024 ** 3)
             cand_ram = f"/dev/shm/EasyColab_Models/{model_id}"
             already_ram_gb = 0.0
             if os.path.isdir(cand_ram):
@@ -2760,7 +3208,7 @@ def _get_model_dirs(model_id: str) -> Tuple[Optional[str], str, str]:
                         except Exception:
                             pass
             rem_needed_gb = max(0.0, float(spec["approx_size_gb"]) - already_ram_gb)
-            # 仅当 /dev/shm 可用空间足以容纳剩余模型分片时才放入内存盘（避免大分片预热中途 ram_dir 变 None 导致 GGUF 分片断链）
+            # 仅当 /dev/shm 配额与容器真实可用物理内存均足以容纳剩余模型分片时才放入内存盘（避免大分片预热中途 ram_dir 变 None 导致 GGUF 分片断链）
             if shm_free_gb >= rem_needed_gb + 2.0:
                 ram_dir = cand_ram
             elif already_ram_gb > 0.1 or (
@@ -2806,6 +3254,7 @@ def _find_existing_model_file(model_id: str, fname: str) -> Optional[str]:
 
 def check_model_files_status(model_id: Optional[str] = None) -> Dict[str, Any]:
     """检查指定开源模型在内存盘/磁盘/云盘上的权重文件完整性与大小"""
+    _refresh_drive_mount_state()
     target_id = model_id if (model_id and model_id in MODEL_CATALOG) else SELECTED_MODEL_ID
     spec = MODEL_CATALOG[target_id]
     req_files = spec["files"]
@@ -2909,6 +3358,7 @@ def _get_storage_metrics_dict(refresh_drive: bool = False) -> Dict[str, Any]:
             pass
 
     now = time.time()
+    _refresh_drive_mount_state()
     if DRIVE_MOUNTED and (refresh_drive or (now - _CACHED_DRIVE_METRICS["ts"]) >= 15.0):
         if os.path.exists("/content/drive/MyDrive"):
             try:
@@ -2919,6 +3369,11 @@ def _get_storage_metrics_dict(refresh_drive: bool = False) -> Dict[str, Any]:
                 _CACHED_DRIVE_METRICS["ts"] = now
             except Exception:
                 pass
+    elif not DRIVE_MOUNTED:
+        _CACHED_DRIVE_METRICS["drive_total_gb"] = 0.0
+        _CACHED_DRIVE_METRICS["drive_free_gb"] = 0.0
+        _CACHED_DRIVE_METRICS["drive_used_gb"] = 0.0
+        _CACHED_DRIVE_METRICS["ts"] = now
 
     return {
         "ram_total_gb": ram_total_gb,
@@ -3149,7 +3604,7 @@ def build_structured_prompt(
 # ==============================================================================
 def _async_backup_to_drive(src_file: str, dst_dir: str, fname: str):
     """在后台线程中将内存盘/NVMe下载好的权重同步到 Google Drive，不阻塞用户加载模型"""
-    if not DRIVE_MOUNTED:
+    if not _refresh_drive_mount_state():
         return
     try:
         dst_file = os.path.join(dst_dir, fname)
@@ -3160,6 +3615,7 @@ def _async_backup_to_drive(src_file: str, dst_dir: str, fname: str):
         with open(src_file, "rb") as rf, open(tmp_dst, "wb") as wf:
             shutil.copyfileobj(rf, wf, length=32 * 1024 * 1024)
         os.replace(tmp_dst, dst_file)
+        _flush_drive_file(dst_file)
         print(f"[后台云盘同步完成] {fname} 已持久化保存至 Google Drive")
     except Exception as e:
         print(f"[后台云盘同步跳过] {fname}: {e}")
@@ -3168,6 +3624,7 @@ def _async_backup_to_drive(src_file: str, dst_dir: str, fname: str):
 def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = "") -> Tuple[bool, str]:
     global SELECTED_MODEL_ID
     touch_activity()
+    _refresh_drive_mount_state()
     if MODEL_DOWNLOAD_STATE["is_downloading"]:
         return False, "模型正在下载中，请稍候..."
 
@@ -3190,15 +3647,22 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
             login(token=hf_token.strip(), add_to_git_credential=False)
 
         ram_dir, nvme_dir, drive_dir = _get_model_dirs(target_id)
+        already_ready_gb = 0.0
+        for fn_chk, _ in req_files:
+            ex_p = _find_existing_model_file(target_id, fn_chk)
+            if ex_p and os.path.exists(ex_p):
+                already_ready_gb += os.path.getsize(ex_p) / (1024 ** 3)
+        missing_approx_gb = max(0.5, float(spec["approx_size_gb"]) - already_ready_gb)
+
         drive_has_space = False
         if DRIVE_MOUNTED and os.path.exists("/content/drive/MyDrive"):
             try:
                 drive_free_gb = shutil.disk_usage("/content/drive/MyDrive").free / (1024 ** 3)
-                drive_has_space = drive_free_gb >= spec["approx_size_gb"] + 2.0
+                drive_has_space = drive_free_gb >= missing_approx_gb + 2.0
                 if not drive_has_space:
                     print(
-                        f"ℹ️ Google Drive 剩余空间 ({drive_free_gb:.1f} GB) 小于 {spec['name']} 所需容量 "
-                        f"({spec['approx_size_gb']:.1f} GB)，自动改用实例本地高速 NVMe 磁盘 ({nvme_dir}) 存储！"
+                        f"ℹ️ Google Drive 剩余空间 ({drive_free_gb:.1f} GB) 小于 {spec['name']} 待下载增量 "
+                        f"({missing_approx_gb:.1f} GB)，自动改用实例本地高速 NVMe 磁盘 ({nvme_dir}) 存储！"
                     )
             except Exception:
                 drive_has_space = False
@@ -3395,7 +3859,7 @@ def _resolve_and_stage_model_file(model_id: str, fname: str) -> str:
             return ram_target
         try:
             os.makedirs(os.path.dirname(ram_target), exist_ok=True)
-            free_shm = shutil.disk_usage("/dev/shm").free
+            free_shm = _safe_shm_available_bytes(reserve_ram_gb=34.0)
             file_sz = os.path.getsize(existing)
             if free_shm > file_sz + (2 * 1024 ** 3):
                 t0 = time.time()
@@ -4436,10 +4900,11 @@ def unload_model_from_vram_core(model_id: Optional[str] = None) -> Tuple[bool, s
 
 def _ensure_vram_for_new_model_locked(target_id: str, required_free_gb: float) -> List[str]:
     """
-    多模型共驻智能显存守卫 (LRU Eviction)：
+    多模型共驻智能显存与系统内存守卫 (LRU Eviction)：
     - 若目标模型自身已在显存中，先卸载旧实例以便重载；
-    - 若剩余可用显存 >= required_free_gb，保留所有已加载模型实现多模型同时常驻！
-    - 仅当剩余显存不足以容纳新模型时，按最早加载顺序 (LRU) 自动腾退旧模型，防止 CUDA OOM。
+    - 若已有内存热备型 33B 巨型管线驻留，按其前向峰值 (~64GB VRAM) 与系统内存余量核算可用空间，
+      使 Qwen3.8-GGUF (~21GB) 在 G4 96GB 上可与其安全共驻，而切换到另一巨型模型时自动先腾退旧实例释放 125GB+ 内存！
+    - 仅当剩余可用空间不足以容纳新模型时，按最早加载顺序 (LRU) 自动腾退旧模型，防止 CUDA / Cgroup OOM。
     """
     evicted: List[str] = []
     if target_id in LOADED_RUNTIMES:
@@ -4448,12 +4913,39 @@ def _ensure_vram_for_new_model_locked(target_id: str, required_free_gb: float) -
     if not torch.cuda.is_available():
         return evicted
 
-    free_gb = torch.cuda.mem_get_info("cuda")[0] / (1024 ** 3)
-    while free_gb < required_free_gb and LOADED_RUNTIMES:
+    def _effective_free_vram_gb() -> float:
+        free_b, total_b = torch.cuda.mem_get_info("cuda")
+        raw_free = free_b / (1024 ** 3)
+        total_v = total_b / (1024 ** 3)
+        used_v = max(0.0, total_v - raw_free)
+        # 内存热备型巨型管线在空闲期将 62GB 主干暂存 CPU 内存（当前显存占用接近 0），推理期需瞬时占用 ~64GB 显存
+        has_cpu_offloaded_giant = any(
+            mid == "minimax_h3"
+            or "ComponentsManager" in str(rt.get("mode_label", ""))
+            or "内存热备" in str(rt.get("mode_label", ""))
+            for mid, rt in LOADED_RUNTIMES.items()
+        )
+        if has_cpu_offloaded_giant and used_v < 58.0:
+            reserved_peak = 64.0
+            return min(raw_free, max(0.0, total_v - max(used_v, reserved_peak)))
+        return raw_free
+
+    target_spec = MODEL_CATALOG.get(target_id, {})
+    target_arch = target_spec.get("pipeline_arch") or target_id
+    needs_heavy_cpu_ram = target_arch == "minimax_h3"
+
+    while LOADED_RUNTIMES:
+        eff_free = _effective_free_vram_gb()
+        _, avail_ram = _get_system_ram_gb()
+        ram_short = needs_heavy_cpu_ram and avail_ram < 132.0 and any(
+            "内存热备" in str(rt.get("mode_label", "")) or "ComponentsManager" in str(rt.get("mode_label", ""))
+            for rt in LOADED_RUNTIMES.values()
+        )
+        if eff_free >= required_free_gb and not ram_short:
+            break
         oldest_id = next(iter(LOADED_RUNTIMES))
         names = _unload_model_locked(oldest_id)
         evicted.extend(names)
-        free_gb = torch.cuda.mem_get_info("cuda")[0] / (1024 ** 3)
     return evicted
 
 
@@ -5953,6 +6445,8 @@ def generate_video(
                 get_history_videos(save_dir),
             )
 
+    if _refresh_drive_mount_state() and save_dir == os.path.join(os.getcwd(), "outputs"):
+        save_dir = DEFAULT_OUTPUT_DIR
     os.makedirs(save_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"minimax_h3_{task_mode}_{timestamp}_seed{seed}.mp4"
@@ -5991,6 +6485,7 @@ def generate_video(
                 fps=int(fps),
                 audio_sample_rate=32000,
             )
+            output_path = _persist_generated_output_to_drive(output_path)
             video = None
             audio = None
             _reclaim_transient_gpu_memory()
@@ -6779,7 +7274,7 @@ def _get_comfy_preset_packs_status(persist_root: str) -> List[Dict[str, Any]]:
 
 def _resolve_comfyui_persistence_paths() -> Tuple[str, str, str, str, bool]:
     comfy_root = "/content/ComfyUI" if os.path.exists("/content") else os.path.join(os.getcwd(), "ComfyUI")
-    if os.path.exists("/content/drive/MyDrive"):
+    if _refresh_drive_mount_state():
         persist_root = "/content/drive/MyDrive/EasyColab_ComfyUI"
         return comfy_root, persist_root, "drive_symlink", "Google Drive 实时软链直连", True
     if _has_rclone_drive_remote():
@@ -7820,6 +8315,17 @@ def disconnect_colab_runtime() -> str:
     except Exception:
         pass
     try:
+        if hasattr(os, "sync"):
+            os.sync()
+    except Exception:
+        pass
+    try:
+        if _is_drive_mounted_live():
+            from google.colab import drive
+            drive.flush_and_unmount()
+    except Exception:
+        pass
+    try:
         from google.colab import runtime
         runtime.unassign()
         return "🛑 已向 Colab 发送释放运行时指令，实例即将关闭并停止扣除计算单元。"
@@ -8418,6 +8924,7 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
             JOBS[job_id]["message"] = "图像编辑/重绘模式下请至少拖入一张输入图片"
             return
 
+        _refresh_drive_mount_state()
         os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
         last_filename = None
         last_seed = base_seed
@@ -8604,6 +9111,7 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
 
                 if not os.path.exists(output_path) or os.path.getsize(output_path) < 256:
                     raise RuntimeError("输出媒体文件未成功生成或写入为空")
+                output_path = _persist_generated_output_to_drive(output_path)
 
                 with CONSOLE_LOCK:
                     ACTIVE_TQDM_BARS.clear()
@@ -8612,7 +9120,7 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
             sub_elapsed = round(time.time() - sub_start, 1)
             last_filename = filename
             kind_cn = "图像" if media_type == "image" else "视频"
-            print(f"[{spec['name']}] {kind_cn}生成完成 | 耗时 {sub_elapsed}s | Seed: {current_seed} | 文件: {filename}")
+            print(f"[{spec['name']}] {kind_cn}生成完成 | 耗时 {sub_elapsed}s | Seed: {current_seed} | 已保存: {output_path}")
             media_item = {
                 "index": batch_idx + 1,
                 "seed": current_seed,
@@ -9663,7 +10171,9 @@ def attach_macos_api_routes(app: FastAPI):
     global API_AUTH_KEY, API_REQUEST_COUNT
 
     @app.get("/minimax_api/status")
-    def api_status(model_id: Optional[str] = None):
+    def api_status(model_id: Optional[str] = None, touch: Optional[int] = None):
+        if touch:
+            touch_activity()
         return get_gpu_status_dict(model_id=model_id)
 
     @app.post("/minimax_api/select_model")
@@ -9791,6 +10301,7 @@ def attach_macos_api_routes(app: FastAPI):
         auth_err = _verify_external_api_auth(request, protocol="openai")
         if auth_err:
             return auth_err
+        touch_activity()
         now_ts = int(time.time())
         any_qwen_loaded = ("qwen38_27b" in LOADED_RUNTIMES) or ("qwen38_27b_gguf" in LOADED_RUNTIMES)
 
@@ -9933,16 +10444,19 @@ def attach_macos_api_routes(app: FastAPI):
             think_parts: List[str] = []
             text_parts: List[str] = []
             out_chunks = 0
-            try:
-                for piece in streamer:
-                    out_chunks += 1
-                    for kind, val in parser.feed(piece):
-                        if kind == "thinking":
-                            think_parts.append(val)
-                        elif kind == "text":
-                            text_parts.append(val)
-            finally:
-                cancel_event.set()
+            with _ActiveApiStreamGuard():
+                try:
+                    for piece in streamer:
+                        out_chunks += 1
+                        if out_chunks % 64 == 0:
+                            touch_activity()
+                        for kind, val in parser.feed(piece):
+                            if kind == "thinking":
+                                think_parts.append(val)
+                            elif kind == "text":
+                                text_parts.append(val)
+                finally:
+                    cancel_event.set()
             tail_events, tool_calls = parser.finish()
             for kind, val in tail_events:
                 if kind == "thinking":
@@ -10039,23 +10553,44 @@ def attach_macos_api_routes(app: FastAPI):
         def _openai_sse_stream():
             parser = _IncrementalQwenStreamParser(start_in_thinking=start_in_thinking)
             comp_chars = 0
+            chunk_idx = 0
             emitted_any_delta = False
-            try:
-                first_chunk = {
-                    "id": cmpl_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_ts,
-                    "model": req_model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
+            with _ActiveApiStreamGuard():
+                try:
+                    first_chunk = {
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": req_model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
 
-                for ev_type, piece in _iter_streamer_with_keepalive(streamer):
-                    if ev_type == "keepalive":
-                        yield ": keepalive\n\n"
-                        continue
-                    comp_chars += len(piece)
-                    for kind, val in parser.feed(piece):
+                    for ev_type, piece in _iter_streamer_with_keepalive(streamer):
+                        if ev_type == "keepalive":
+                            touch_activity()
+                            yield ": keepalive\n\n"
+                            continue
+                        comp_chars += len(piece)
+                        chunk_idx += 1
+                        if chunk_idx % 64 == 0:
+                            touch_activity()
+                        for kind, val in parser.feed(piece):
+                            if not val:
+                                continue
+                            emitted_any_delta = True
+                            delta_payload = {"reasoning_content": val} if kind == "thinking" else {"content": val}
+                            chunk_obj = {
+                                "id": cmpl_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": req_model,
+                                "choices": [{"index": 0, "delta": delta_payload, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n"
+
+                    tail_events, tool_calls = parser.finish()
+                    for kind, val in tail_events:
                         if not val:
                             continue
                         emitted_any_delta = True
@@ -10069,31 +10604,16 @@ def attach_macos_api_routes(app: FastAPI):
                         }
                         yield f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n"
 
-                tail_events, tool_calls = parser.finish()
-                for kind, val in tail_events:
-                    if not val:
-                        continue
-                    emitted_any_delta = True
-                    delta_payload = {"reasoning_content": val} if kind == "thinking" else {"content": val}
-                    chunk_obj = {
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_ts,
-                        "model": req_model,
-                        "choices": [{"index": 0, "delta": delta_payload, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n"
-
-                gen_thread.join(timeout=5.0)
-                if getattr(streamer, "generated_tokens", 0) > 0:
-                    c_hit = int(getattr(streamer, "cached_tokens", 0) or 0)
-                    p_tot = int(getattr(streamer, "prompt_tokens", prompt_tokens) or prompt_tokens)
-                    print(
-                        f"[OpenAI API] 流式完成 | prompt={p_tot} (cached={c_hit}) | "
-                        f"out={streamer.generated_tokens} tokens | {streamer.tok_per_sec} tok/s"
-                    )
-            finally:
-                cancel_event.set()
+                    gen_thread.join(timeout=5.0)
+                    if getattr(streamer, "generated_tokens", 0) > 0:
+                        c_hit = int(getattr(streamer, "cached_tokens", 0) or 0)
+                        p_tot = int(getattr(streamer, "prompt_tokens", prompt_tokens) or prompt_tokens)
+                        print(
+                            f"[OpenAI API] 流式完成 | prompt={p_tot} (cached={c_hit}) | "
+                            f"out={streamer.generated_tokens} tokens | {streamer.tok_per_sec} tok/s"
+                        )
+                finally:
+                    cancel_event.set()
 
             if err_box[0] is not None and not emitted_any_delta and not tool_calls:
                 print(f"[OpenAI API] 流式推理报错: {err_box[0]}")
@@ -10231,6 +10751,7 @@ def attach_macos_api_routes(app: FastAPI):
         auth_err = _verify_external_api_auth(request, protocol="anthropic")
         if auth_err:
             return auth_err
+        touch_activity()
         body = await request.json()
         raw_txt = json.dumps(body.get("messages", []), ensure_ascii=False)
         bundle = _get_qwen_llm_bundle(preferred_model_id=str(body.get("model") or ""))
@@ -10318,15 +10839,20 @@ def attach_macos_api_routes(app: FastAPI):
             parser = _IncrementalQwenStreamParser(start_in_thinking=start_in_thinking)
             think_parts: List[str] = []
             text_parts: List[str] = []
-            try:
-                for piece in streamer:
-                    for kind, val in parser.feed(piece):
-                        if kind == "thinking":
-                            think_parts.append(val)
-                        elif kind == "text":
-                            text_parts.append(val)
-            finally:
-                cancel_event.set()
+            out_chunks = 0
+            with _ActiveApiStreamGuard():
+                try:
+                    for piece in streamer:
+                        out_chunks += 1
+                        if out_chunks % 64 == 0:
+                            touch_activity()
+                        for kind, val in parser.feed(piece):
+                            if kind == "thinking":
+                                think_parts.append(val)
+                            elif kind == "text":
+                                text_parts.append(val)
+                finally:
+                    cancel_event.set()
             tail_events, tool_calls = parser.finish()
             for kind, val in tail_events:
                 if kind == "thinking":
@@ -10466,13 +10992,35 @@ def attach_macos_api_routes(app: FastAPI):
                 )
                 return out_strs
 
-            try:
-                for ev_type, piece in _iter_streamer_with_keepalive(streamer):
-                    if ev_type == "keepalive":
-                        yield ": keepalive\n\n"
-                        continue
-                    comp_chars += len(piece)
-                    for kind, val in parser.feed(piece):
+            chunk_idx = 0
+            with _ActiveApiStreamGuard():
+                try:
+                    for ev_type, piece in _iter_streamer_with_keepalive(streamer):
+                        if ev_type == "keepalive":
+                            touch_activity()
+                            yield ": keepalive\n\n"
+                            continue
+                        comp_chars += len(piece)
+                        chunk_idx += 1
+                        if chunk_idx % 64 == 0:
+                            touch_activity()
+                        for kind, val in parser.feed(piece):
+                            if not val:
+                                continue
+                            for s in _ensure_block(kind):
+                                yield s
+                            delta_obj = (
+                                {"type": "thinking_delta", "thinking": val}
+                                if kind == "thinking"
+                                else {"type": "text_delta", "text": val}
+                            )
+                            yield _anthropic_sse_event(
+                                "content_block_delta",
+                                {"type": "content_block_delta", "index": active_block_idx, "delta": delta_obj},
+                            )
+
+                    tail_events, tool_calls = parser.finish()
+                    for kind, val in tail_events:
                         if not val:
                             continue
                         for s in _ensure_block(kind):
@@ -10487,27 +11035,11 @@ def attach_macos_api_routes(app: FastAPI):
                             {"type": "content_block_delta", "index": active_block_idx, "delta": delta_obj},
                         )
 
-                tail_events, tool_calls = parser.finish()
-                for kind, val in tail_events:
-                    if not val:
-                        continue
-                    for s in _ensure_block(kind):
-                        yield s
-                    delta_obj = (
-                        {"type": "thinking_delta", "thinking": val}
-                        if kind == "thinking"
-                        else {"type": "text_delta", "text": val}
-                    )
-                    yield _anthropic_sse_event(
-                        "content_block_delta",
-                        {"type": "content_block_delta", "index": active_block_idx, "delta": delta_obj},
-                    )
-
-                gen_thread.join(timeout=5.0)
-                if getattr(streamer, "generated_tokens", 0) > 0:
-                    print(f"[Anthropic API] 流式完成 | {streamer.generated_tokens} tokens | {streamer.tok_per_sec} tok/s")
-            finally:
-                cancel_event.set()
+                    gen_thread.join(timeout=5.0)
+                    if getattr(streamer, "generated_tokens", 0) > 0:
+                        print(f"[Anthropic API] 流式完成 | {streamer.generated_tokens} tokens | {streamer.tok_per_sec} tok/s")
+                finally:
+                    cancel_event.set()
 
             if active_block_type is not None:
                 if active_block_type == "thinking":
@@ -10762,8 +11294,13 @@ def attach_macos_api_routes(app: FastAPI):
     @app.get("/minimax_api/media/{filename}")
     def api_download_media(filename: str):
         touch_activity()
+        _refresh_drive_mount_state()
         safe_name = os.path.basename(filename)
         file_path = os.path.join(DEFAULT_OUTPUT_DIR, safe_name)
+        if not os.path.exists(file_path):
+            local_fallback = os.path.join(os.getcwd(), "outputs", safe_name)
+            if os.path.exists(local_fallback):
+                file_path = local_fallback
         if not os.path.exists(file_path) and DRIVE_MOUNTED:
             for leg_out in LEGACY_DRIVE_OUTPUT_DIRS:
                 alt_path = os.path.join(leg_out, safe_name)
@@ -11365,13 +11902,18 @@ if __name__ == "__main__":
     import getpass
     from gradio import networking
 
-    password = _DEPLOY_PASSWORD or getpass.getpass("Management password (24+ URL-safe characters): ")
+    if authenticated_ingress is not None and (_DEPLOY_PASSWORD or (sys.stdin is not None and sys.stdin.isatty())):
+        password = _DEPLOY_PASSWORD or getpass.getpass("Management password (24+ URL-safe characters): ")
+        ingress_ctx = authenticated_ingress(password)
+    else:
+        ingress_ctx = contextlib.nullcontext()
+
     # Unwind the ingress context on a headless hot redeploy (pkill sends TERM).
     def stop_server(signum, frame):
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop_server)
-    with authenticated_ingress(password):
+    with ingress_ctx:
         ui = create_ui()
         ui.queue()
         app, _, _ = ui.launch(

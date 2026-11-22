@@ -25,7 +25,7 @@ from typing import Dict, List, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "VERSION"
-APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.is_file() else "1.2.0"
+APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.is_file() else "1.2.1"
 WIN_APP_DIR = REPO_ROOT / "windows_app"
 LAUNCHER_SRC_DIR = WIN_APP_DIR / "win_launcher"
 DIST_ROOT = REPO_ROOT / "dist"

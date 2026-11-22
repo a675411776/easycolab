@@ -190,6 +190,17 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self.is_waking_colab: bool = False
         self.is_releasing_colab: bool = False
         self._auth_busy: bool = False
+        self.keepalive_proxy_ws_connected: bool = False
+        self._active_wake_proc: Optional[subprocess.Popen] = None
+        self._wake_obtained_url_this_run: bool = False
+        self._wake_lock = threading.Lock()
+        self._wake_run_token: int = 0
+        self._keepalive_daemon_proc: Optional[subprocess.Popen] = None
+        self._is_starting_keepalive_daemon: bool = False
+        self._keepalive_lock = threading.Lock()
+        self._keepalive_epoch: int = 0
+        self._is_closing: bool = False
+        self._win_sleep_assertion_active: bool = False
 
         # ── Remote Runtime & Telemetry State ──
         self.is_connected: bool = False
@@ -225,6 +236,10 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self._remote_context_synced: bool = False
         self._remote_idle_synced: bool = False
         self._remote_api_key_synced: bool = False
+        self._last_idle_sync_attempt_ts: float = 0.0
+        self._last_context_sync_attempt_ts: float = 0.0
+        self._last_local_interaction_ts: float = time.time()
+        self._last_remote_touch_sent_ts: float = 0.0
         self._synced_custom_model_ids_by_server: Dict[str, set[str]] = {}
         self._syncing_custom_models_inflight: set[str] = set()
         self._poll_interval_sec: float = 1.2
@@ -329,11 +344,45 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
     # ─── Initialization & Lifecycle ──────────────────────────────────────────
 
+    def _on_app_about_to_quit(self) -> None:
+        self._is_closing = True
+        self.stop_active_wake_process()
+        self.stop_keepalive_daemon()
+        self.stop_local_gateway()
+        self.sync_windows_runtime_activity_assertion(force_clear=True)
+
+    def record_local_interaction(self) -> None:
+        self._last_local_interaction_ts = time.time()
+
+    def sync_windows_runtime_activity_assertion(self, force_clear: bool = False) -> None:
+        """Hold ES_SYSTEM_REQUIRED on Windows while connected or busy so OS sleep doesn't drop Colab WS/jobs."""
+        should_hold = (not force_clear) and bool(
+            self.is_connected
+            or self.is_waking_colab
+            or self.is_generating
+            or self.is_downloading_weights
+            or self.is_loading_model
+        )
+        if should_hold == self._win_sleep_assertion_active:
+            return
+        self._win_sleep_assertion_active = should_hold
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            flags = (ES_CONTINUOUS | ES_SYSTEM_REQUIRED) if should_hold else ES_CONTINUOUS
+            ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(flags))
+        except Exception:
+            pass
+
     def start(self) -> None:
         app_inst = QCoreApplication.instance()
         if app_inst is not None and not self._about_to_quit_connected:
             try:
-                app_inst.aboutToQuit.connect(self.stop_local_gateway)
+                app_inst.aboutToQuit.connect(self._on_app_about_to_quit)
                 self._about_to_quit_connected = True
             except Exception:
                 pass
@@ -549,8 +598,13 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
     def set_colab_server_url(self, url: str) -> None:
         cleaned = (url or "").strip()
         if cleaned != self.colab_server_url:
-            self._remote_api_key_synced = False
-            self._synced_custom_model_ids_by_server.clear()
+            if cleaned.rstrip("/") != self.normalized_base_url:
+                self._remote_api_key_synced = False
+                self._remote_idle_synced = False
+                self._remote_context_synced = False
+                self._last_idle_sync_attempt_ts = 0.0
+                self._last_context_sync_attempt_ts = 0.0
+                self._synced_custom_model_ids_by_server.clear()
             self.colab_server_url = cleaned
             self._save_setting("colabServerURL", cleaned)
             self.sync_local_gateway_snapshot()
@@ -1043,20 +1097,42 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         tick = self._tick_counter
 
         if self.is_connected:
-            if not self.is_generating:
+            if not self.is_releasing_colab:
+                if not self.is_generating:
+                    self.check_colab_status(silent=True)
+                elif tick % 6 == 0:
+                    self.check_colab_status(silent=True)
+            if self.cli_logged_in and not self.is_waking_colab and not self.is_releasing_colab:
+                self.ensure_keepalive_daemon_running()
+        else:
+            if self._keepalive_daemon_proc is not None:
+                self.stop_keepalive_daemon()
+            if not self.is_releasing_colab and self.normalized_base_url and (tick % 4 == 0):
                 self.check_colab_status(silent=True)
-            elif tick % 6 == 0:
-                self.check_colab_status(silent=True)
-        elif self.normalized_base_url and (tick % 4 == 0):
-            self.check_colab_status(silent=True)
 
-        # Smart Keepalive & Official CU Ledger Sync
-        if tick % 32 == 0 and self.cli_logged_in and not self.is_waking_colab:
+        # Smart Keepalive & Official CU Ledger Sync (when disconnected, poll every ~40s; when connected, daemon streams live CU or fallback keepalive runs every ~50s)
+        if (
+            tick % 16 == 0
+            and self.cli_logged_in
+            and not self.is_waking_colab
+            and not self.is_releasing_colab
+            and not self.is_connected
+        ):
+            self.refresh_official_colab_account_usage()
+        elif (
+            tick % 20 == 0
+            and self.cli_logged_in
+            and not self.is_waking_colab
+            and not self.is_releasing_colab
+            and self.is_connected
+            and not self._is_keepalive_daemon_alive()
+        ):
             should_keepalive = self.is_connected and (
                 self.is_generating
                 or self.is_downloading_weights
                 or self.is_loading_model
                 or self.is_auto_load_queued_after_download
+                or self.comfy_running
                 or self.comfy_starting
                 or self.comfy_downloading_weight
                 or self.comfy_queue_running > 0
@@ -1067,12 +1143,11 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                 self.keepalive_colab_runtime()
             else:
                 self.refresh_official_colab_account_usage()
-        elif tick % 16 == 0 and self.cli_logged_in and not self.is_connected:
-            self.refresh_official_colab_account_usage()
 
     # ─── Remote Status & Telemetry Handling ──────────────────────────────────
 
     def reset_stale_remote_runtime_state(self, message: str = "") -> None:
+        self.stop_keepalive_daemon()
         self.is_connected = False
         self.gpu_name = tr("尚未连接云端 GPU", "Cloud GPU Not Connected")
         self.vram_used_gb = 0.0
@@ -1105,7 +1180,10 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self._remote_context_synced = False
         self._remote_idle_synced = False
         self._remote_api_key_synced = False
+        self._last_idle_sync_attempt_ts = 0.0
+        self._last_context_sync_attempt_ts = 0.0
         self._synced_custom_model_ids_by_server.clear()
+        self.sync_windows_runtime_activity_assertion()
         self.sync_local_gateway_snapshot()
         if message:
             self.status_message = strip_emoji(self.masked_url(message))
@@ -1160,6 +1238,8 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self.telemetry_changed.emit()
 
     def _apply_status_response(self, d: dict, update_status_msg: bool = False) -> None:
+        if self.is_releasing_colab or self._is_closing:
+            return
         self._consecutive_status_failures = 0
         was_connected = self.is_connected
         self.is_connected = True
@@ -1293,18 +1373,38 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         elif not was_connected:
             self.status_message = tr(f"已连接云端 {self.gpu_name}！", f"Connected to cloud {self.gpu_name}!")
 
-        # One-time per-connection remote config syncs
-        if not self._remote_context_synced:
-            self._remote_context_synced = True
-            if d.get("context_length") != self.context_length_tokens:
+        # Retryable per-connection remote config syncs (8s cooldown)
+        now_sync = time.time()
+        remote_ctx = d.get("context_length")
+        if remote_ctx is not None:
+            if int(remote_ctx) == self.context_length_tokens:
+                self._remote_context_synced = True
+            elif not self._remote_context_synced and (now_sync - self._last_context_sync_attempt_ts) >= 8.0:
+                self._last_context_sync_attempt_ts = now_sync
                 self.sync_context_length_to_colab()
-        if not self._remote_idle_synced:
-            self._remote_idle_synced = True
-            if d.get("idle_timeout_minutes") != self.idle_timeout_minutes:
+
+        remote_idle = d.get("idle_timeout_minutes")
+        if remote_idle is not None:
+            if int(remote_idle) == self.idle_timeout_minutes:
+                self._remote_idle_synced = True
+            elif (now_sync - self._last_idle_sync_attempt_ts) >= 8.0:
+                self._remote_idle_synced = False
+                self._last_idle_sync_attempt_ts = now_sync
                 self.update_idle_timeout_config(self.idle_timeout_minutes)
+
         if not d.get("api_key_configured", False) and not self._remote_api_key_synced:
             self._remote_api_key_synced = True
             self.sync_api_key_to_colab(initialize_only=True)
+
+        self.sync_windows_runtime_activity_assertion()
+        if (
+            self.cli_logged_in
+            and not self.is_waking_colab
+            and not self.is_releasing_colab
+            and not self._is_closing
+            and not self._is_keepalive_daemon_alive()
+        ):
+            self.ensure_keepalive_daemon_running()
 
         self.sync_local_gateway_snapshot()
         self._record_telemetry_sample(force=not was_connected)
@@ -1436,12 +1536,22 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self._status_check_inflight = True
         target_model = self.selected_model_id
         timeout_s = 28 if self.is_generating else (20 if silent else 22)
+        now_ts = time.time()
+        should_touch = (not silent) or (
+            (now_ts - self._last_local_interaction_ts) < 30.0
+            and (now_ts - self._last_remote_touch_sent_ts) >= 20.0
+        )
+        if should_touch:
+            self._last_remote_touch_sent_ts = now_ts
+        status_params: Dict[str, Any] = {"model_id": target_model}
+        if should_touch:
+            status_params["touch"] = 1
 
         def worker() -> None:
             try:
                 r = self._admin_request("GET",
                     f"{base}/minimax_api/status",
-                    params={"model_id": target_model},
+                    params=status_params,
                     timeout=timeout_s,
                 )
                 if r.status_code == 200:
@@ -1629,6 +1739,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
         spec = self.active_model_spec
         self.is_downloading_weights = True
+        self.sync_windows_runtime_activity_assertion()
         self.model_task_progress = 0.01
         self.status_message = tr(
             f"正在云端启动 8 线程极速下载 {spec.name} 权重...",
@@ -1646,6 +1757,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
                 def done() -> None:
                     self.is_downloading_weights = False
+                    self.sync_windows_runtime_activity_assertion()
                     self.state_changed.emit()
 
                 self._dispatch_ui(done)
@@ -1681,6 +1793,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                 f"正在将 {spec.name} 装载至云端 GPU 显存...",
                 f"Loading {spec.name} into cloud GPU VRAM...",
             )
+        self.sync_windows_runtime_activity_assertion()
         self.state_changed.emit()
 
         payload: Dict[str, Any] = {
@@ -1760,6 +1873,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                     self.is_downloading_weights = False
                     self.is_auto_load_queued_after_download = False
                     self.is_loading_model = False
+                    self.sync_windows_runtime_activity_assertion()
                     self.state_changed.emit()
 
                 self._dispatch_ui(done)
@@ -1863,6 +1977,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         token = str(uuid.uuid4())
         self._active_generation_token = token
         self.is_generating = True
+        self.sync_windows_runtime_activity_assertion()
         self.progress_value = 0.01
         self.current_job_elapsed = 0.0
         self._job_start_local_ts = time.time()
@@ -2184,6 +2299,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
                 if st == "completed":
                     self.is_generating = False
+                    self.sync_windows_runtime_activity_assertion()
                     self.progress_value = 1.0
                     b_cnt = int(j.get("batch_count") or 1)
                     if b_cnt > 1 and saved_files:
@@ -2202,6 +2318,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                             self.chat_history[assistant_idx].content = msg
                             self.chat_changed.emit()
                     self.is_generating = False
+                    self.sync_windows_runtime_activity_assertion()
                     self.progress_value = 0.0
                     self.status_message = msg
                     self.state_changed.emit()
@@ -2215,6 +2332,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
     def cancel_current_generation(self) -> None:
         self._active_generation_token = str(uuid.uuid4())
         self.is_generating = False
+        self.sync_windows_runtime_activity_assertion()
         self.progress_value = 0.0
         self.status_message = tr(
             "已发送停止信号，正在中断云端 GPU 当前采样任务...",

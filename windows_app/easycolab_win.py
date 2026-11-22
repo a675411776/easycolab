@@ -5,7 +5,7 @@ EasyColab Windows Native Desktop Client — Main Entry Point.
 Supports two execution modes:
   1. Standard GUI Studio mode: `EasyColab.exe` or `python windows_app/easycolab_win.py`
   2. Headless Bridge CLI mode (used internally by packaged EasyColab.exe):
-     `EasyColab.exe --bridge-cli <auth_status|auth_url|auth_code|auth_logout|wake|keepalive|stop_all> ...`
+     `EasyColab.exe --bridge-cli <auth_status|auth_url|auth_code|auth_logout|wake|keepalive|keepalive_daemon|stop_all> ...`
 """
 from __future__ import annotations
 
@@ -101,6 +101,7 @@ if len(sys.argv) >= 2 and sys.argv[1] == "--bridge-cli":
     import colab_bridge
 
     colab_bridge.run_cli(sys.argv[2:])
+    raise SystemExit(0)
 
 
 def _apply_windows_app_id() -> None:

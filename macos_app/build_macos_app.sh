@@ -10,7 +10,7 @@ VERSION_FILE="${PROJECT_ROOT}/VERSION"
 if [ -f "${VERSION_FILE}" ]; then
     APP_VERSION="$(tr -d '[:space:]' < "${VERSION_FILE}")"
 fi
-APP_VERSION="${APP_VERSION:-1.1.0}"
+APP_VERSION="${APP_VERSION:-1.2.1}"
 BUNDLE_DIR="${PROJECT_ROOT}/${APP_NAME}.app"
 CONTENTS_DIR="${BUNDLE_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
@@ -151,6 +151,7 @@ if swiftc -O \
     "${SCRIPT_DIR}/EasyColabStudio.swift" \
     "${SCRIPT_DIR}"/Sources/*.swift \
     -o "${MACOS_DIR}/${EXEC_NAME}_x86_64" 2>/dev/null; then
+    rm -f "${MACOS_DIR}/${EXEC_NAME}"
     lipo -create -output "${MACOS_DIR}/${EXEC_NAME}" \
         "${MACOS_DIR}/${EXEC_NAME}_arm64" \
         "${MACOS_DIR}/${EXEC_NAME}_x86_64"
